@@ -26,6 +26,18 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
+      - name: Free disk space on runner
+        # GHA runners ship with ~14GB free; the RunPod PyTorch base unpacks to ~30GB.
+        # This action removes preinstalled SDKs we don't need, recovering ~30GB.
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false   # this option is slow and we don't need it
+          swap-storage: false
+
       - name: Checkout
         uses: actions/checkout@v4
 
