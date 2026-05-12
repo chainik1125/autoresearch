@@ -21,6 +21,7 @@ _PASSTHROUGH_SECRETS = (
     "AWS_SECRET_ACCESS_KEY",
     "ANTHROPIC_API_KEY",
     "HF_TOKEN",
+    "WANDB_API_KEY",          # for sae_lens / general training-metrics logging
 )
 
 

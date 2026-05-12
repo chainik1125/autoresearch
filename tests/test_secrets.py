@@ -19,6 +19,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[pytest.MonkeyPatch]:
         "AWS_SECRET_ACCESS_KEY",
         "ANTHROPIC_API_KEY",
         "HF_TOKEN",
+        "WANDB_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     yield monkeypatch
@@ -63,10 +64,12 @@ def test_passthrough_secrets_only_when_present(clean_env, monkeypatch: pytest.Mo
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "ak-test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sk-test")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.setenv("WANDB_API_KEY", "wb-test")
     env = env_for_run(_run(), _settings())
     assert env["AWS_ACCESS_KEY_ID"] == "ak-test"
     assert env["AWS_SECRET_ACCESS_KEY"] == "sk-test"
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-test"
+    assert env["WANDB_API_KEY"] == "wb-test"
     assert "HF_TOKEN" not in env  # not set in env, so not passed through
 
 
