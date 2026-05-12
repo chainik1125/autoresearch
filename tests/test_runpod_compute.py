@@ -72,7 +72,7 @@ def test_create_session_request_shape() -> None:
     assert body["gpuTypeIds"] == ["NVIDIA H100 80GB HBM3"]
     assert body["networkVolumeId"] == "vol-xyz"
     assert body["env"]["RUN_ID"] == "abc123"
-    assert "22/tcp" in body["ports"]
+    assert body["ports"] == ["22/tcp"]
     assert body["containerDiskInGb"] == 50
     assert "containerRegistryAuthId" not in body  # spec didn't set it
 
@@ -121,7 +121,7 @@ def test_create_session_passes_extra_ports_and_disables_ssh() -> None:
     compute.create_session(spec)
     body = captured["body"]
     assert "22/tcp" not in body["ports"]
-    assert "8000/http" in body["ports"]
+    assert body["ports"] == ["8000/http"]
 
 
 def test_create_session_includes_registry_auth_when_set() -> None:

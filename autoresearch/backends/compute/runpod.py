@@ -79,7 +79,7 @@ class RunPodCompute:
             "networkVolumeId": spec.network_volume_id,
             "containerDiskInGb": spec.container_disk_gb,
             "env": dict(spec.env),
-            "ports": ",".join(ports) if ports else None,
+            "ports": ports or None,                  # RunPod expects array, not comma-joined string
             "interruptible": spec.spot,
             "containerRegistryAuthId": spec.container_registry_auth_id,
         }
