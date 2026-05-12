@@ -18,8 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && pip install --no-cache-dir hf-transfer
 
 # Bake the package into the image. Any package change requires rebuild + push.
+# Also copy autoresearch.toml so the controller has its project config at /app —
+# pydantic-settings reads from cwd, and the entrypoint runs from /app.
 WORKDIR /app
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md autoresearch.toml ./
 COPY autoresearch ./autoresearch
 RUN pip install --no-cache-dir .
 

@@ -70,6 +70,8 @@ def create_app() -> FastAPI:
 
 def run() -> None:
     """Entrypoint used by `autoresearch serve`."""
+    import os
+
     import uvicorn
 
     settings = Settings.load()
@@ -77,10 +79,12 @@ def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Railway/Fly/Heroku all set $PORT dynamically; honor that over our setting.
+    port = int(os.environ.get("PORT") or settings.controller_port)
     uvicorn.run(
         "autoresearch.controller.server:create_app",
         factory=True,
         host=settings.controller_host,
-        port=settings.controller_port,
+        port=port,
         log_level="info",
     )
