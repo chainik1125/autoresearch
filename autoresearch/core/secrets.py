@@ -28,6 +28,8 @@ def env_for_run(
     run: Run,
     settings: Settings,
     *,
+    project_repo_token: str | None = None,
+    project_repo_branch: str | None = None,
     extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build the env dict injected into the pod for this run.
@@ -65,6 +67,15 @@ def env_for_run(
     for name in _PASSTHROUGH_SECRETS:
         if val := os.environ.get(name):
             env[name] = val
+
+    # PAT for cloning private project repos on the pod. Per-dispatch override
+    # wins over the controller's saved value.
+    token = project_repo_token or settings.project_repo_token
+    if token:
+        env["PROJECT_REPO_TOKEN"] = token
+    branch = project_repo_branch or settings.project_repo_branch
+    if branch:
+        env["PROJECT_REPO_BRANCH"] = branch
 
     if extra:
         env.update(extra)

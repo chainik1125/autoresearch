@@ -33,9 +33,29 @@ export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${WORKSPACE}/.cache/pip}"
 # Clone the user's project repo on first boot (idempotent across pod restarts because
 # the volume persists). After clone, expose pipelines/ at the path PIPELINE_MODULE_PATH
 # expects.
+#
+# Private repos: if PROJECT_REPO_TOKEN is set, inject it as basic auth in the clone URL.
+# We rewrite the URL just-in-time and never echo it (the token is sensitive). GitHub
+# accepts <token>@github.com as basic auth for both classic and fine-grained PATs.
+#
+# Branch: PROJECT_REPO_BRANCH (set by make_compatible.md when it creates an adaptation
+# branch) overrides the default branch.
 if [[ -n "${PROJECT_REPO_URL:-}" ]] && [[ ! -d "${WORKSPACE}/project/.git" ]]; then
-    echo "[entrypoint] cloning ${PROJECT_REPO_URL} -> ${WORKSPACE}/project"
-    git clone --depth 1 "${PROJECT_REPO_URL}" "${WORKSPACE}/project"
+    AUTH_URL="${PROJECT_REPO_URL}"
+    if [[ -n "${PROJECT_REPO_TOKEN:-}" ]]; then
+        # Insert token after the scheme; works for https://github.com/... URLs.
+        AUTH_URL="${PROJECT_REPO_URL/https:\/\//https://${PROJECT_REPO_TOKEN}@}"
+        echo "[entrypoint] cloning private repo (token redacted) -> ${WORKSPACE}/project"
+    else
+        echo "[entrypoint] cloning ${PROJECT_REPO_URL} -> ${WORKSPACE}/project"
+    fi
+    CLONE_ARGS=(--depth 1)
+    if [[ -n "${PROJECT_REPO_BRANCH:-}" ]]; then
+        CLONE_ARGS+=(--branch "${PROJECT_REPO_BRANCH}")
+        echo "[entrypoint] (branch: ${PROJECT_REPO_BRANCH})"
+    fi
+    GIT_TERMINAL_PROMPT=0 git clone "${CLONE_ARGS[@]}" "${AUTH_URL}" "${WORKSPACE}/project"
+    unset AUTH_URL  # don't leave the auth-bearing URL hanging in shell state
 fi
 if [[ -d "${WORKSPACE}/project/pipelines" ]] && [[ ! -e "${WORKSPACE}/pipelines" ]]; then
     ln -s "${WORKSPACE}/project/pipelines" "${WORKSPACE}/pipelines"

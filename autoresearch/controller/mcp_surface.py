@@ -49,9 +49,19 @@ def build_mcp(
         source_model: str | None = None,
         gpu: str | None = None,
         budget_usd: float | None = None,
+        project_repo_token: str | None = None,
+        project_repo_branch: str | None = None,
     ) -> dict[str, Any]:
         """Start a TRANSFER run: dispatch a pod that runs `pipeline_name` against
-        `target_model`. Optionally pass `source_model` for postflight comparison."""
+        `target_model`. Optionally pass `source_model` for postflight comparison.
+
+        `project_repo_token` is a GitHub PAT for private-repo cloning; overrides
+        the controller's saved token for this dispatch only. The token lives in
+        controller memory just long enough to inject into the pod env and is
+        never persisted to storage or logs.
+
+        `project_repo_branch` overrides the default branch so the pod clones a
+        specific branch (e.g. one made by make_compatible.md)."""
         if compute is None:
             raise ValueError("compute backend not configured (set compute=runpod in autoresearch.toml)")
         params: dict[str, Any] = {"target_model": target_model}
@@ -66,6 +76,8 @@ def build_mcp(
             storage=storage,
             compute=compute,
             gpu=gpu,
+            project_repo_token=project_repo_token,
+            project_repo_branch=project_repo_branch,
         )
         return {"run_id": run.id, "status": run.status.value, "pod_handle": run.pod_handle}
 

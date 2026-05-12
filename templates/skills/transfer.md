@@ -17,6 +17,42 @@ stream back to R2.
    available. If the user named one (`/transfer fra_measurement qwen-32b`),
    confirm it's in the list. If not, ask which pipeline.
 
+   **If `list_pipelines` returns empty or the named pipeline isn't found**:
+   the project hasn't been adapted yet. Switch to the `make_compatible`
+   sub-skill (TODO: not yet implemented) which creates a branch in the user's
+   project repo and wraps their existing measurement code as a Pipeline class.
+   After the branch is pushed, come back here with the new branch name and
+   pass it as `project_repo_branch` to `start_transfer`.
+
+1a. **Private-repo PAT discovery.** If the user's project repo is private
+   (or might be), the pod needs a GitHub PAT to clone it. Resolve in order:
+
+   a. **Existing controller config**: if `start_transfer` succeeds without a
+      `project_repo_token` arg, the controller already has one set. Done.
+
+   b. **User's shell env**: try common names from `~/.zshenv` /
+      `~/.bashrc` / current env:
+      ```
+      ! printenv | grep -iE '^(GIT_PAT|GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT)='
+      ```
+      If found, pass its value as `project_repo_token`. **Do not echo the
+      token value in your reply** — confirm "found a PAT in env" and proceed.
+
+   c. **Conversation context**: scan this conversation for any PAT-like
+      string the user may have mentioned (e.g. they said "my token is in
+      `$MY_PAT`"). Use it if applicable. **Do not paste any literal token
+      value back to the user.**
+
+   d. **Prompt the user**: ask them what env var their PAT lives in (not
+      the token value itself — keep it env-resident):
+      > "I need a GitHub PAT with `repo` scope to clone your private
+      > project. What env var holds it? (e.g. `GIT_PAT`, `GITHUB_TOKEN`)
+      > Or paste the variable *name*, not the value."
+      Then `! printenv $NAME` and pass through.
+
+   For public repos, skip the whole step — `start_transfer` works without
+   a token.
+
 2. **Confirm the model arguments.**
    - `target_model` — the model to run against (e.g. `Qwen/Qwen2.5-32B`). Use
      full HuggingFace identifiers when possible — the pod loads via `from_pretrained`.

@@ -21,3 +21,8 @@ Important point: It sounds like they basically say this kind of thing is unlikel
     - Repo: https://github.com/romovpa/claudini
 
 4. EDEN 
+
+
+5. Oscar Runpod wrapper:
+
+    - Repo: https://github.com/oscar-gilg/zombuul

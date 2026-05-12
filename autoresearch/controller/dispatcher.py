@@ -17,12 +17,24 @@ from autoresearch.core import secrets
 from autoresearch.core.run import Run, RunStatus
 
 
-def _build_spec(run: Run, settings: Settings, *, gpu: str | None = None) -> SessionSpec:
+def _build_spec(
+    run: Run,
+    settings: Settings,
+    *,
+    gpu: str | None = None,
+    project_repo_token: str | None = None,
+    project_repo_branch: str | None = None,
+) -> SessionSpec:
     if not settings.runpod_network_volume_id:
         raise ValueError(
             "runpod_network_volume_id is required for dispatch — set it in autoresearch.toml"
         )
-    env = secrets.env_for_run(run, settings)
+    env = secrets.env_for_run(
+        run,
+        settings,
+        project_repo_token=project_repo_token,
+        project_repo_branch=project_repo_branch,
+    )
     if settings.project_repo_url:
         env["PROJECT_REPO_URL"] = settings.project_repo_url
     return SessionSpec(
@@ -46,6 +58,8 @@ def dispatch_new(
     storage: StorageBackend,
     compute: ComputeBackend,
     gpu: str | None = None,
+    project_repo_token: str | None = None,
+    project_repo_branch: str | None = None,
 ) -> Run:
     """Create a fresh Run and launch its pod. Returns the persisted Run."""
     run = Run(
@@ -55,7 +69,11 @@ def dispatch_new(
         budget_cap_usd=budget_usd,
     )
     run.save(storage)
-    spec = _build_spec(run, settings, gpu=gpu)
+    spec = _build_spec(
+        run, settings, gpu=gpu,
+        project_repo_token=project_repo_token,
+        project_repo_branch=project_repo_branch,
+    )
     handle = compute.create_session(spec)
     run.pod_handle = handle.id
     run.status = RunStatus.QUEUED

@@ -91,3 +91,32 @@ def test_extra_overrides_existing(clean_env) -> None:
 def test_pipeline_module_path_pod_default(clean_env) -> None:
     env = env_for_run(_run(), _settings())
     assert env["AUTORESEARCH_PIPELINE_MODULE_PATH"] == "/workspace/pipelines"
+
+
+def test_project_repo_token_per_dispatch_wins(clean_env) -> None:
+    """A per-dispatch token overrides the controller's saved value."""
+    env = env_for_run(
+        _run(),
+        _settings(project_repo_token="controller-token"),
+        project_repo_token="per-dispatch-token",
+    )
+    assert env["PROJECT_REPO_TOKEN"] == "per-dispatch-token"
+
+
+def test_project_repo_token_falls_back_to_settings(clean_env) -> None:
+    env = env_for_run(_run(), _settings(project_repo_token="controller-token"))
+    assert env["PROJECT_REPO_TOKEN"] == "controller-token"
+
+
+def test_no_token_no_env(clean_env) -> None:
+    env = env_for_run(_run(), _settings())
+    assert "PROJECT_REPO_TOKEN" not in env
+
+
+def test_project_repo_branch_propagates(clean_env) -> None:
+    env = env_for_run(
+        _run(),
+        _settings(),
+        project_repo_branch="autoresearch/transfer-qwen32b",
+    )
+    assert env["PROJECT_REPO_BRANCH"] == "autoresearch/transfer-qwen32b"

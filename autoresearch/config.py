@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     controller_port: int = 8000
     base_image_tag: str | None = None
     project_repo_url: str | None = None       # cloned onto the pod's persistent volume on first boot
+    project_repo_token: str | None = None     # GitHub PAT for private-repo cloning (optional)
+    project_repo_branch: str | None = None    # specific branch to clone; default = remote's HEAD
     supervisor_poll_seconds: float = 30.0
     supervisor_stale_minutes: int = 5         # heartbeat staleness threshold (short tools)
     supervisor_long_call_stale_hours: int = 2 # threshold when in_long_pipeline_call=true

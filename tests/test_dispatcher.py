@@ -105,6 +105,38 @@ def test_redispatch_terminates_old_pod_and_spawns_new(tmp_path: Path) -> None:
     assert compute.created[0].network_volume_id == compute.created[1].network_volume_id
 
 
+def test_dispatch_passes_repo_token_to_pod_env(tmp_path: Path) -> None:
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings()
+    dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        project_repo_token="ghp_smoke_token",
+        project_repo_branch="autoresearch/feature-x",
+    )
+    spec = compute.created[0]
+    assert spec.env["PROJECT_REPO_TOKEN"] == "ghp_smoke_token"
+    assert spec.env["PROJECT_REPO_BRANCH"] == "autoresearch/feature-x"
+
+
+def test_redispatch_preserves_repo_token(tmp_path: Path) -> None:
+    """A pod restart must reuse the same token; otherwise the new pod fails
+    to clone the private repo and the run is dead."""
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings(project_repo_token="controller-default-token")
+    run = dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+    )
+    fresh = dispatcher.redispatch(run, settings=settings, storage=storage, compute=compute)
+    # Both pods got the token from settings.
+    assert compute.created[0].env["PROJECT_REPO_TOKEN"] == "controller-default-token"
+    assert compute.created[1].env["PROJECT_REPO_TOKEN"] == "controller-default-token"
+    assert fresh.pod_handle == "pod-2"
+
+
 def test_redispatch_swallows_termination_errors(tmp_path: Path) -> None:
     """If the old pod is already gone, redispatch must still succeed."""
     storage = LocalStorage(tmp_path / "store")
