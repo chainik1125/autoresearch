@@ -46,7 +46,7 @@ def test_version(app) -> None:
 
 
 def test_mcp_endpoint_mounted(app) -> None:
-    """Verify the MCP sub-app is mounted under /mcp (full URL: /mcp/mcp).
+    """Verify the MCP sub-app is mounted under /mcp (full URL: /mcp/).
 
     We don't actually send an MCP JSON-RPC request here — that requires a
     session init dance covered by the in-process call_tool tests in
@@ -55,6 +55,7 @@ def test_mcp_endpoint_mounted(app) -> None:
 
     mounts = [r for r in app.routes if isinstance(r, Mount) and r.path == "/mcp"]
     assert len(mounts) == 1
-    # The mounted app exposes /mcp internally (FastMCP's streamable_http_path default).
+    # We set FastMCP's streamable_http_path to "/" so the route inside the
+    # mounted app is "/" — the full URL is just /mcp/ (no /mcp/mcp redirect).
     sub_paths = [getattr(r, "path", None) for r in mounts[0].app.routes]
-    assert "/mcp" in sub_paths
+    assert "/" in sub_paths

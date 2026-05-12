@@ -37,7 +37,10 @@ def create_app() -> FastAPI:
         if compute is not None
         else None
     )
+    # streamable_http_path="" so the mounted route ends up at /mcp/ (no /mcp/mcp/
+    # redirect quirk for POST clients that don't follow 307 on non-GET methods).
     mcp = build_mcp(settings=settings, storage=storage, compute=compute, model_client=model_client)
+    mcp.settings.streamable_http_path = "/"
     mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
@@ -87,4 +90,9 @@ def run() -> None:
         host=settings.controller_host,
         port=port,
         log_level="info",
+        # Behind a TLS-terminating proxy (Railway, Fly, etc.) the Host header
+        # is rewritten and X-Forwarded-* carries the real client info. Without
+        # these, uvicorn rejects requests with "421 Invalid Host header".
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
