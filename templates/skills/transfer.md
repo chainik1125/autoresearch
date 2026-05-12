@@ -178,10 +178,17 @@ start_transfer(
                                     #   pipeline takes something beyond target_model.
     gpu           = "...",          # optional, overrides default
     budget_usd    = ...,            # optional, overrides default
-    project_repo_token = "...",     # optional
-    project_repo_branch = "...",    # optional, from make_compatible
+    project_repo_url    = "...",    # **always pass** from the project's autoresearch.toml
+    project_repo_branch = "...",    # **always pass** when make_compatible made a branch
+    project_repo_token  = "...",    # optional; only for private repos
 )
 ```
+
+**Always pass `project_repo_url`** — read it from the project's
+`autoresearch.toml`. If you don't, the pod inherits the *controller's* default
+URL, which is whatever was baked into the controller image (often a stale
+leftover from a different project). Same for `project_repo_branch`: if
+`make_compatible` just created `autoresearch/<workflow>-<slug>`, pass it.
 
 **On `params` vs the convenience args**: Phase 0 may have identified an axis
 of variation that isn't "the model" — e.g., hookpoint, dataset, hyperparam.
