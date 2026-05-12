@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from urllib.parse import urlparse
 
 from fastapi import FastAPI
 
@@ -41,6 +42,20 @@ def create_app() -> FastAPI:
     # redirect quirk for POST clients that don't follow 307 on non-GET methods).
     mcp = build_mcp(settings=settings, storage=storage, compute=compute, model_client=model_client)
     mcp.settings.streamable_http_path = "/"
+
+    # MCP defaults to DNS-rebinding protection that whitelists only localhost.
+    # For our public-internet deployment, add the controller's hostname so
+    # requests from the wild aren't rejected with "Invalid Host header".
+    public_url = settings.controller_public_url or settings.controller_url
+    if public_url:
+        host = urlparse(public_url).hostname
+        if host:
+            mcp.settings.transport_security.allowed_hosts.append(host)
+            mcp.settings.transport_security.allowed_hosts.append(f"{host}:*")
+            scheme = urlparse(public_url).scheme or "https"
+            mcp.settings.transport_security.allowed_origins.append(f"{scheme}://{host}")
+            mcp.settings.transport_security.allowed_origins.append(f"{scheme}://{host}:*")
+
     mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
