@@ -50,6 +50,27 @@ if not, invoke `make_compatible.md`.
 
 ### Long-term
 
+- [ ] **Generalize the `start_transfer` params model — Phase 2.** *(Surfaced
+      while wiring fra_proj's SAE training pipeline 2026-05-12.)* The MCP
+      signature hardcodes `target_model` + `source_model` as the only varying
+      axes; Phase 1 (in flight as of this entry) adds an additive
+      `params: dict` to unblock pipelines that vary other things (hook_name,
+      hook_layer, training_tokens, etc.). Phase 2 is the proper refactor:
+        - Make `params: dict` the *primary* arg; drop or deprecate the rigid
+          target_model/source_model args.
+        - Add `baseline_params: dict | None` so the postflight validator can
+          compare *any* axis. e.g., dataset-swap → baseline_params =
+          {"dataset": <old>}; SAE-hookpoint swap → baseline_params =
+          {"hook_name": <old>}.
+        - Refactor `workflows/transfer.py`'s postflight hook to look up the
+          baseline result by `baseline_params` rather than the current
+          "look up source_model" semantics.
+        - Update `cli.py:cmd_run` to take arbitrary `--params` JSON without
+          requiring `--target-model` / `--source-model`.
+      Why it matters: lets Claude's intent-discovery resolve any axis of
+      variation into a flat params dict, instead of the MCP API having an
+      opinion about which axis is "real." Aligned with the "use Claude's
+      intelligence flexibly" goal.
 - [ ] **Non-repo / tarball-upload path.** Users whose project has no git
       remote (or no push access) currently can't use `/transfer` at all.
       Support: package project as a tarball, upload to R2, pod fetches +

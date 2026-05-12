@@ -170,14 +170,23 @@ Call the MCP tool:
 ```
 start_transfer(
     pipeline_name = "...",
-    target_model  = "...",
-    source_model  = "...",          # optional
+    target_model  = "...",          # convenience shorthand; goes into params
+    source_model  = "...",          # convenience shorthand; goes into params
+    params        = {...},          # arbitrary pipeline-specific params
+                                    #   (hook_name, dataset, training_tokens, etc.)
+                                    #   This is the general way — use whenever the
+                                    #   pipeline takes something beyond target_model.
     gpu           = "...",          # optional, overrides default
     budget_usd    = ...,            # optional, overrides default
     project_repo_token = "...",     # optional
     project_repo_branch = "...",    # optional, from make_compatible
 )
 ```
+
+**On `params` vs the convenience args**: Phase 0 may have identified an axis
+of variation that isn't "the model" — e.g., hookpoint, dataset, hyperparam.
+Pass those keys via `params`. The Pipeline reads them in its `run()`. The
+controller's MCP API does not have an opinion about which keys are "real."
 
 Returns `{run_id, status, pod_handle}`. Confirm to the user:
 

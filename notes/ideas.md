@@ -50,5 +50,35 @@ In the W2S automated researcher, the human-operator surface is a web dashboard (
 
 
 
+## General abstraction idea
+
+1. Input task description
+    - "Pick up an idea off the idea shelf"
+    - We will want some agent interaction. At this stage, however, you are just aiming for _conceptual clarity_ not yet questions of how much money, etc... the bean counting will come in stage 2.
+    - Ah, this makes it a little unclear conceptually if the "Pre-register predictions" stage or, more generally, the Pre-theorizing stage should go here, in part 2, or have its own stage. Probably cleanest if it is its own stage
+
+2. Pre-theorizing stage
+
+    - Here you want to have as a minimum a pre-registered prediction of how the experiment will go, and what it will tell you.
+    - This is also an opportune time to have MMR. In particular, the zeroth order workflow of making a call to GPT-Pro (including, if need be the workaround of having computer use sign into my ChatGPT and copy and paste the input, then copy and paste the response.)
+    - Probably here, you want to check if there is a metric in the input task description, and if not each pre-registered prediction should at the least cache it out in a prediction for what this value will be.
+    
+
+
+3. Prepare experiment
+
+
+4. Run experiments
+
+    - Get hardware going
+    - 
+
+
+Note! You will want some meta-optimization agents going: I.e. you may want a pre-experiment layer which determines what the minimum 'time to insight' experiment is. Maybe this is its own stage, maybe a parrallel stage (figuring that out whilst you're running the core experiment), maybe a mid-point-check-in stage.
+
+
+## Problems
+
+1. De-risking runs: although technically not an issue for an experiment where you already have a promising result, still seems good practice. Shuld probably make this optional.
 
 

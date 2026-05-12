@@ -45,15 +45,30 @@ def build_mcp(
     @mcp.tool()
     def start_transfer(
         pipeline_name: str,
-        target_model: str,
+        target_model: str | None = None,
         source_model: str | None = None,
         gpu: str | None = None,
         budget_usd: float | None = None,
+        params: dict[str, Any] | None = None,
         project_repo_token: str | None = None,
         project_repo_branch: str | None = None,
     ) -> dict[str, Any]:
-        """Start a TRANSFER run: dispatch a pod that runs `pipeline_name` against
-        `target_model`. Optionally pass `source_model` for postflight comparison.
+        """Start a TRANSFER run: dispatch a pod that runs `pipeline_name`.
+
+        Params model (Phase 1):
+          - `target_model` / `source_model` are *convenience shorthand* for
+            the common model-swap case. They become entries in the run's
+            params dict.
+          - `params` is the *primary* way to specify what the pipeline
+            receives. Anything Claude's intent-discovery determined needs
+            to vary (hook_name, dataset, hyperparam, etc.) goes here.
+          - The two are additive: explicit keys in `params` win over
+            convenience args if both are passed for the same key.
+          - At least one of `target_model` or `params` must be provided.
+
+        Phase 2 (deferred, see working_notes.md): drop target_model/
+        source_model from the signature, add baseline_params for general
+        postflight comparison.
 
         `project_repo_token` is a GitHub PAT for private-repo cloning; overrides
         the controller's saved token for this dispatch only. The token lives in
@@ -64,13 +79,26 @@ def build_mcp(
         specific branch (e.g. one made by make_compatible.md)."""
         if compute is None:
             raise ValueError("compute backend not configured (set compute=runpod in autoresearch.toml)")
-        params: dict[str, Any] = {"target_model": target_model}
-        if source_model:
-            params["source_model"] = source_model
+
+        final_params: dict[str, Any] = {}
+        if target_model is not None:
+            final_params["target_model"] = target_model
+        if source_model is not None:
+            final_params["source_model"] = source_model
+        if params:
+            # Explicit `params` keys override convenience args for the same key.
+            final_params.update(params)
+
+        if not final_params:
+            raise ValueError(
+                "must provide at least one of `target_model` or `params` "
+                "(the pipeline needs something in its params dict)"
+            )
+
         run = dispatcher.dispatch_new(
             workflow="transfer",
             pipeline_name=pipeline_name,
-            params=params,
+            params=final_params,
             budget_usd=budget_usd or settings.default_budget_usd,
             settings=settings,
             storage=storage,

@@ -90,6 +90,68 @@ async def test_start_transfer_creates_run_and_pod(setup) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_transfer_accepts_extra_params(setup) -> None:
+    """The `params` kwarg lets callers (e.g. Claude's intent-discovery)
+    pass arbitrary pipeline-specific config (hook_name, training_tokens,
+    etc.) without the MCP API hardcoding which axis is varying."""
+    mcp, storage, _, _ = setup
+    out = await call(mcp, "start_transfer", {
+        "pipeline_name": "fra_example",
+        "target_model": "Qwen/Qwen2.5-32B",
+        "params": {
+            "hook_name": "blocks.32.ln1.hook_normalized",
+            "hook_layer": 32,
+            "training_tokens": 500_000,
+        },
+    })
+    run = Run.load(storage, out["run_id"])
+    assert run.params["target_model"] == "Qwen/Qwen2.5-32B"
+    assert run.params["hook_name"] == "blocks.32.ln1.hook_normalized"
+    assert run.params["hook_layer"] == 32
+    assert run.params["training_tokens"] == 500_000
+
+
+@pytest.mark.asyncio
+async def test_start_transfer_params_only(setup) -> None:
+    """target_model is no longer required if params carries it (or
+    something else the pipeline reads)."""
+    mcp, storage, _, _ = setup
+    out = await call(mcp, "start_transfer", {
+        "pipeline_name": "fra_example",
+        "params": {
+            "target_model": "Qwen/Qwen2.5-32B",
+            "hook_name": "blocks.32.hook_resid_post",
+        },
+    })
+    run = Run.load(storage, out["run_id"])
+    assert run.params["target_model"] == "Qwen/Qwen2.5-32B"
+    assert run.params["hook_name"] == "blocks.32.hook_resid_post"
+
+
+@pytest.mark.asyncio
+async def test_start_transfer_params_override_convenience(setup) -> None:
+    """Explicit keys in `params` win over convenience args if both
+    specify the same key. (Phase 2 of the generalization deprecates the
+    convenience args entirely.)"""
+    mcp, storage, _, _ = setup
+    out = await call(mcp, "start_transfer", {
+        "pipeline_name": "fra_example",
+        "target_model": "from-shorthand",
+        "params": {"target_model": "from-params-wins"},
+    })
+    run = Run.load(storage, out["run_id"])
+    assert run.params["target_model"] == "from-params-wins"
+
+
+@pytest.mark.asyncio
+async def test_start_transfer_requires_some_input(setup) -> None:
+    """Calling with neither target_model nor params is an error."""
+    mcp, _, _, _ = setup
+    with pytest.raises(Exception, match="target_model.*params"):
+        await call(mcp, "start_transfer", {"pipeline_name": "fra_example"})
+
+
+@pytest.mark.asyncio
 async def test_list_and_get_run(setup) -> None:
     mcp, storage, _, _ = setup
     run = Run(workflow="transfer", pipeline_name="fra_example",
