@@ -23,6 +23,7 @@ def _settings(**overrides) -> Settings:
         runpod_network_volume_id="vol-test",
         runpod_default_image="my/image:latest",
         runpod_container_disk_gb=75,
+        runpod_container_registry_auth_id="reg-auth-xyz",
         default_gpu="H100 80GB",
         controller_public_url="https://ctrl.example.com",
         project_repo_url="https://github.com/me/proj",
@@ -59,6 +60,7 @@ def test_dispatch_new_creates_run_and_pod(tmp_path: Path) -> None:
     assert spec.image == "my/image:latest"
     assert spec.network_volume_id == "vol-test"
     assert spec.container_disk_gb == 75
+    assert spec.container_registry_auth_id == "reg-auth-xyz"
     assert spec.env["RUN_ID"] == run.id
     assert spec.env["HF_HOME"] == "/workspace/.huggingface"
     assert spec.env["PROJECT_REPO_URL"] == "https://github.com/me/proj"

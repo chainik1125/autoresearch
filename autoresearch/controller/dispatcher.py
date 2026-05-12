@@ -32,6 +32,7 @@ def _build_spec(run: Run, settings: Settings, *, gpu: str | None = None) -> Sess
         env=env,
         name=f"autoresearch-{run.id}",
         container_disk_gb=settings.runpod_container_disk_gb,
+        container_registry_auth_id=settings.runpod_container_registry_auth_id,
     )
 
 

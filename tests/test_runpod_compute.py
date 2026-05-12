@@ -74,6 +74,7 @@ def test_create_session_request_shape() -> None:
     assert body["env"]["RUN_ID"] == "abc123"
     assert "22/tcp" in body["ports"]
     assert body["containerDiskInGb"] == 50
+    assert "containerRegistryAuthId" not in body  # spec didn't set it
 
     assert handle.id == "pod-abc"
     assert handle.status == "running"
@@ -121,6 +122,25 @@ def test_create_session_passes_extra_ports_and_disables_ssh() -> None:
     body = captured["body"]
     assert "22/tcp" not in body["ports"]
     assert "8000/http" in body["ports"]
+
+
+def test_create_session_includes_registry_auth_when_set() -> None:
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        import json as _json
+        captured["body"] = _json.loads(req.content)
+        return httpx.Response(201, json={"id": "p", "desiredStatus": "QUEUED"})
+
+    compute = _mock_compute(handler)
+    spec = SessionSpec(
+        gpu="A40",
+        image="ghcr.io/me/private:latest",
+        network_volume_id="v",
+        container_registry_auth_id="my-cred-id",
+    )
+    compute.create_session(spec)
+    assert captured["body"]["containerRegistryAuthId"] == "my-cred-id"
 
 
 def test_status_mapping() -> None:

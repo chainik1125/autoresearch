@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     runpod_data_center: str | None = None
     runpod_container_disk_gb: int = 50
     runpod_default_image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+    runpod_container_registry_auth_id: str | None = None
 
     # --- Models / validation ---
     anthropic_api_key: str | None = None

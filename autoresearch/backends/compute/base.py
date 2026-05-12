@@ -29,6 +29,7 @@ class SessionSpec(BaseModel):
     expose_ssh: bool = True                    # open port 22 for takeover handoff
     extra_ports: list[str] = Field(default_factory=list)  # e.g. ["8000/http"]
     spot: bool = False                         # community/spot pods are cheaper but preemptible
+    container_registry_auth_id: str | None = None  # backend-side saved registry credential
 
 
 class SessionHandle(BaseModel):

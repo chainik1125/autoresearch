@@ -81,6 +81,7 @@ class RunPodCompute:
             "env": dict(spec.env),
             "ports": ",".join(ports) if ports else None,
             "interruptible": spec.spot,
+            "containerRegistryAuthId": spec.container_registry_auth_id,
         }
         body = {k: v for k, v in body.items() if v is not None}
 
