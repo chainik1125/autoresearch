@@ -33,11 +33,18 @@ if not, invoke `make_compatible.md`.
 - [ ] Rewrite `templates/skills/transfer.md` to: detect → bridge → setup_check → dispatch
 - [ ] Pod entrypoint: support `PROJECT_REPO_BRANCH` so dispatched pods can clone
       the bridge-created branch instead of the default branch
-- [ ] **Private-repo cloning support.** Pod entrypoint accepts a
-      `PROJECT_REPO_TOKEN` env (GitHub PAT) and rewrites the clone URL as
-      `https://<token>@github.com/owner/repo.git`. Wire through
-      `core/secrets.py` and `backends/compute/runpod.py`. *Required if
-      fra_proj is private.*
+- [x] **Private-repo cloning support.** (2026-05-12, commit `547761d`)
+      `Settings.project_repo_token` + per-dispatch override via
+      `start_transfer(project_repo_token=...)`. `core/secrets.py` emits
+      `PROJECT_REPO_TOKEN` into pod env when set. `docker/entrypoint.sh`
+      rewrites the clone URL just-in-time with basic-auth, redacts the
+      token in logs, unsets the auth-bearing URL after clone, uses
+      `GIT_TERMINAL_PROMPT=0` to fail-fast. PAT-discovery fallback chain
+      documented in `templates/skills/transfer.md` (controller default →
+      user shell env grep → conversation scan → prompt for env var
+      name). Also added `PROJECT_REPO_BRANCH` propagation for the bridge
+      skill to clone a specific branch. *Needs controller redeploy
+      (`railway up`) to pick up.*
 - [ ] First end-to-end test: bridge Claude adapts `fra_proj` on a branch,
       `/transfer` dispatches against that branch, FRA runs on Qwen-32B.
 
