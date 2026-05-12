@@ -21,7 +21,7 @@ def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AUTORESEARCH_PREFLIGHT", "false")
     monkeypatch.setenv("AUTORESEARCH_POSTFLIGHT", "false")
     monkeypatch.setenv("AUTORESEARCH_SUMMARIZE_ERRORS", "false")
-    monkeypatch.setenv("AUTORESEARCH_PIPELINE_MODULE_PATH", "templates/pipelines")
+    monkeypatch.setenv("AUTORESEARCH_PIPELINE_MODULE_PATH", "pipelines")
     # No autoresearch.toml in cwd would still get picked up; ensure clean by
     # chdir'ing tmp_path so the cwd toml lookup misses.
     monkeypatch.chdir(tmp_path)

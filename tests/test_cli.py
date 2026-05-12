@@ -36,7 +36,7 @@ def cli_env(tmp_path: Path) -> dict[str, str]:
     return {
         "AUTORESEARCH_STORAGE": "local",
         "AUTORESEARCH_STORAGE_ROOT": str(tmp_path / "store"),
-        "AUTORESEARCH_PIPELINE_MODULE_PATH": str(REPO_ROOT / "templates" / "pipelines"),
+        "AUTORESEARCH_PIPELINE_MODULE_PATH": str(REPO_ROOT / "pipelines"),
         "AUTORESEARCH_PREFLIGHT": "false",
         "AUTORESEARCH_POSTFLIGHT": "false",
         "AUTORESEARCH_SUMMARIZE_ERRORS": "false",

@@ -153,10 +153,11 @@ def cmd_init(args: argparse.Namespace) -> int:
             print(f"templates directory not found near {__file__}", file=sys.stderr)
             return 2
 
+    pipelines_root = Path(__file__).resolve().parent.parent / "pipelines"
     plan = [
         (template_root / "autoresearch.toml.example", target_root / "autoresearch.toml"),
         (template_root / "skills" / "transfer.md", target_root / ".claude" / "skills" / "transfer.md"),
-        (template_root / "pipelines" / "fra_example.py", target_root / "pipelines" / "fra_example.py"),
+        (pipelines_root / "fra_example.py", target_root / "pipelines" / "fra_example.py"),
     ]
 
     copied = 0

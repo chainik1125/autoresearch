@@ -37,7 +37,7 @@ def _settings(**overrides) -> Settings:
         runpod_api_key="rpa-test",
         runpod_network_volume_id="vol-test",
         runpod_default_image="img",
-        pipeline_module_path="templates/pipelines",
+        pipeline_module_path="pipelines",
         default_gpu="H100 80GB",
     )
     base.update(overrides)

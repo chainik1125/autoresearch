@@ -15,8 +15,12 @@ runpod_network_volume_id = "l7wyka84iy"        # 200GB, autoresearch-fra
 runpod_default_image = "ghcr.io/chainik1125/autoresearch:latest"
 runpod_container_registry_auth_id = "cmp2b493n0051ju07mlw41yu1"  # ghcr-autoresearch, points at GIT_PAT
 
-# Where the user keeps their Pipeline classes. Points at templates/ for this repo's own smoke tests.
-pipeline_module_path = "templates/pipelines"
+# Where the user keeps their Pipeline classes (at the repo root).
+pipeline_module_path = "pipelines"
+
+# Pod entrypoint clones this onto the persistent volume on first boot so the
+# runner has access to pipelines/. For our v1 test we use this repo itself.
+project_repo_url = "https://github.com/chainik1125/autoresearch.git"
 
 # Default budget for new runs (USD).
 default_budget_usd = 5

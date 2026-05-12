@@ -90,4 +90,4 @@ def test_extra_overrides_existing(clean_env) -> None:
 
 def test_pipeline_module_path_pod_default(clean_env) -> None:
     env = env_for_run(_run(), _settings())
-    assert env["PIPELINE_MODULE_PATH"] == "/workspace/pipelines"
+    assert env["AUTORESEARCH_PIPELINE_MODULE_PATH"] == "/workspace/pipelines"

@@ -44,7 +44,9 @@ def env_for_run(
     env: dict[str, str] = {
         "RUN_ID": run.id,
         "CONTROLLER_PUBLIC_URL": settings.controller_public_url or settings.controller_url or "",
-        "PIPELINE_MODULE_PATH": "/workspace/pipelines",
+        # AUTORESEARCH_ prefix matches Settings.model_config.env_prefix so the
+        # pod's Settings.load() actually reads this.
+        "AUTORESEARCH_PIPELINE_MODULE_PATH": "/workspace/pipelines",
 
         "AUTORESEARCH_STORAGE": settings.storage,
         "AUTORESEARCH_STORAGE_BUCKET": settings.storage_bucket or "",
