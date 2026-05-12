@@ -1,0 +1,25 @@
+# autoresearch project config — values here are read by pydantic-settings.
+# Secrets (AWS_*, ANTHROPIC_API_KEY, RUNPOD_API_KEY, HF_TOKEN, CLOUDFLARE_API_FRA) come from env only.
+
+# Tier 1 — structured state on Cloudflare R2 (S3-compatible).
+storage = "s3"
+storage_bucket = "fra-proj"
+storage_endpoint_url = "https://1017e5793f988de0c543f206026b75b7.r2.cloudflarestorage.com"
+storage_region = "auto"
+
+# Tier 2 — compute. Will switch to "runpod" once the backend ships (task 7).
+compute = "local"
+default_gpu = "H100 80GB"                      # H100 / A100-80GB fit Qwen-32B at fp16; A40 needs quantization
+runpod_data_center = "US-CA-2"
+runpod_network_volume_id = "l7wyka84iy"        # 200GB, autoresearch-fra
+
+# Where the user keeps their Pipeline classes. Points at templates/ for this repo's own smoke tests.
+pipeline_module_path = "templates/pipelines"
+
+# Default budget for new runs (USD).
+default_budget_usd = 5
+
+# Validators — off until ANTHROPIC_API_KEY is configured.
+preflight = false
+postflight = false
+summarize_errors = false

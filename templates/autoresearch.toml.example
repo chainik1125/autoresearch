@@ -1,0 +1,38 @@
+# autoresearch project config.
+# Secrets (AWS_*, ANTHROPIC_API_KEY, AUTORESEARCH_RUNPOD_API_KEY, HF_TOKEN)
+# come from env only — do not put tokens here.
+
+# URL of your deployed controller (Railway). Local Claude Code reaches it via MCP.
+controller_url = "https://your-controller.up.railway.app"
+
+# --- Tier 1: structured state on Cloudflare R2 (S3-compatible) ---
+storage = "s3"
+storage_bucket = "your-bucket-name"
+storage_endpoint_url = "https://<your-account-id>.r2.cloudflarestorage.com"
+storage_region = "auto"
+
+# --- Tier 2: compute + persistent volume (where the HF cache lives) ---
+compute = "runpod"
+default_gpu = "H100 80GB"                      # H100 / A100-80GB fit ~32B at fp16
+runpod_data_center = "US-CA-2"
+runpod_network_volume_id = "vol-..."           # ~200GB recommended
+runpod_container_disk_gb = 50
+runpod_default_image = "your-registry/autoresearch:dev"   # built from this repo's Dockerfile
+
+# Optional: clone your project repo onto the pod's volume on first boot.
+# Cleaner than baking pipelines into the image; survives across pods.
+# project_repo_url = "https://github.com/you/your-project.git"
+
+# --- Tier 3: HF Hub ---
+# No config needed — dispatcher sets HF_HOME on the volume automatically.
+# Set HF_TOKEN in the controller's Railway env if you need gated models.
+
+# --- Workflow defaults ---
+default_budget_usd = 30
+pipeline_module_path = "pipelines"             # where your Pipeline classes live
+
+# --- Validation (bounded LLM calls) ---
+preflight = true                               # "is this model name + GPU choice sane?"
+postflight = true                              # "does the result look plausible vs. source?"
+summarize_errors = true                        # explain tracebacks in plain English
+validation_model = "claude-haiku-4-5-20251001"

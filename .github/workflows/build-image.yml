@@ -1,0 +1,66 @@
+name: Build & push controller image
+
+# Triggers on every push to main + manual dispatch. Produces a multi-tag image
+# at ghcr.io/<owner>/<repo>:
+#   - latest             (only from default branch)
+#   - sha-<short-sha>    (every build; this is the tag you pin in autoresearch.toml)
+#   - <branch-name>      (per-branch tag for testing)
+#
+# The image is ~10GB (RunPod's PyTorch base + our package). First build ~15min;
+# subsequent code-only builds ~2min thanks to GHA layer cache.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64        # RunPod pods are amd64; arm64 build wastes ~15min
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print pull command
+        run: |
+          echo "::notice title=Image pushed::Pin this in autoresearch.toml:"
+          echo "  runpod_default_image = \"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-$(echo ${{ github.sha }} | cut -c1-7)\""
