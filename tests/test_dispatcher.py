@@ -120,6 +120,33 @@ def test_dispatch_passes_repo_token_to_pod_env(tmp_path: Path) -> None:
     assert spec.env["PROJECT_REPO_BRANCH"] == "autoresearch/feature-x"
 
 
+def test_dispatch_project_repo_url_per_call_wins(tmp_path: Path) -> None:
+    """Per-dispatch project_repo_url overrides the controller's settings.project_repo_url.
+
+    This is what lets `/transfer` dispatch fra_proj's pipelines without
+    the controller's autoresearch.toml needing to know about fra_proj."""
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings()  # has no project_repo_url
+    dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        project_repo_url="https://github.com/me/fra_proj.git",
+    )
+    assert compute.created[0].env["PROJECT_REPO_URL"] == "https://github.com/me/fra_proj.git"
+
+
+def test_dispatch_project_repo_url_falls_back_to_settings(tmp_path: Path) -> None:
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings(project_repo_url="https://github.com/me/default.git")
+    dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+    )
+    assert compute.created[0].env["PROJECT_REPO_URL"] == "https://github.com/me/default.git"
+
+
 def test_redispatch_preserves_repo_token(tmp_path: Path) -> None:
     """A pod restart must reuse the same token; otherwise the new pod fails
     to clone the private repo and the run is dead."""

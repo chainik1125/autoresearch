@@ -22,6 +22,7 @@ def _build_spec(
     settings: Settings,
     *,
     gpu: str | None = None,
+    project_repo_url: str | None = None,
     project_repo_token: str | None = None,
     project_repo_branch: str | None = None,
 ) -> SessionSpec:
@@ -35,8 +36,10 @@ def _build_spec(
         project_repo_token=project_repo_token,
         project_repo_branch=project_repo_branch,
     )
-    if settings.project_repo_url:
-        env["PROJECT_REPO_URL"] = settings.project_repo_url
+    # Per-dispatch project_repo_url override wins over the controller's setting.
+    repo_url = project_repo_url or settings.project_repo_url
+    if repo_url:
+        env["PROJECT_REPO_URL"] = repo_url
     return SessionSpec(
         gpu=gpu or settings.default_gpu,
         image=settings.runpod_default_image,
@@ -58,6 +61,7 @@ def dispatch_new(
     storage: StorageBackend,
     compute: ComputeBackend,
     gpu: str | None = None,
+    project_repo_url: str | None = None,
     project_repo_token: str | None = None,
     project_repo_branch: str | None = None,
 ) -> Run:
@@ -71,6 +75,7 @@ def dispatch_new(
     run.save(storage)
     spec = _build_spec(
         run, settings, gpu=gpu,
+        project_repo_url=project_repo_url,
         project_repo_token=project_repo_token,
         project_repo_branch=project_repo_branch,
     )

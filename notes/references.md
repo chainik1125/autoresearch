@@ -26,3 +26,6 @@ Important point: It sounds like they basically say this kind of thing is unlikel
 5. Oscar Runpod wrapper:
 
     - Repo: https://github.com/oscar-gilg/zombuul
+    - This seems pretty close to the 'launch rp on something well defined use case'. May well want to reference/re-use some of the stuff here.
+
+

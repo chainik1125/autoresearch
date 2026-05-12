@@ -50,6 +50,7 @@ def build_mcp(
         gpu: str | None = None,
         budget_usd: float | None = None,
         params: dict[str, Any] | None = None,
+        project_repo_url: str | None = None,
         project_repo_token: str | None = None,
         project_repo_branch: str | None = None,
     ) -> dict[str, Any]:
@@ -104,6 +105,7 @@ def build_mcp(
             storage=storage,
             compute=compute,
             gpu=gpu,
+            project_repo_url=project_repo_url,
             project_repo_token=project_repo_token,
             project_repo_branch=project_repo_branch,
         )
