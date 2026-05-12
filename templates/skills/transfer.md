@@ -1,113 +1,237 @@
 ---
 name: transfer
-description: Run an existing measurement pipeline on a different model (e.g. "FRA on Qwen-32B"). Dispatches a RunPod pod via the autoresearch controller and streams findings back. Use when the user wants to take a working pipeline they already have and run it against a new model.
+description: Take an existing research experiment and run it under a changed parameter (different model, different dataset, different domain, etc.) on cloud GPU. Opens with a brief intent-discovery conversation to make sure the experiment is a good fit for the autoresearch pipeline, then either dispatches it as-is, adapts the user's project to fit the Pipeline protocol first, or honestly advises that this isn't a good autoresearch use case. Use whenever the user wants to re-run their measurement under a varied condition.
 ---
 
-# /transfer — run a pipeline against a new model
+# /transfer — re-run an existing experiment under a changed condition
 
-You're orchestrating a transfer: the user has a Pipeline class they've already
-written (in their project's `pipelines/` directory) and wants to run it on a
-different model than they last ran it on. The autoresearch controller (running
-on Railway) dispatches a GPU pod, the runner executes the pipeline, and findings
-stream back to R2.
+The user has a working measurement on some setup and wants to see what it
+does in a related setup — same code on a different model, same model on a
+different dataset, same dataset with a different measurement, etc.
+"TRANSFER" is the broad category of "run the thing again but vary one axis."
 
-## Workflow
+Your job has three phases. Move through them in order; **don't dispatch
+before completing Phase 1**, and **don't run make_compatible before
+completing Phase 0** unless the call is unambiguous (see the skip rule).
 
-1. **Identify the pipeline.** Call the MCP tool `list_pipelines` to see what's
-   available. If the user named one (`/transfer fra_measurement qwen-32b`),
-   confirm it's in the list. If not, ask which pipeline.
+---
 
-   **If `list_pipelines` returns empty or the named pipeline isn't found**:
-   the project hasn't been adapted yet. Switch to the `make_compatible`
-   sub-skill (TODO: not yet implemented) which creates a branch in the user's
-   project repo and wraps their existing measurement code as a Pipeline class.
-   After the branch is pushed, come back here with the new branch name and
-   pass it as `project_repo_branch` to `start_transfer`.
+## Phase 0 — Intent discovery
 
-1a. **Private-repo PAT discovery.** If the user's project repo is private
-   (or might be), the pod needs a GitHub PAT to clone it. Resolve in order:
+**Cap: 5 follow-up questions, total.** Get to clarity efficiently or
+declare you have enough to proceed.
 
-   a. **Existing controller config**: if `start_transfer` succeeds without a
-      `project_repo_token` arg, the controller already has one set. Done.
+**Skip Phase 0 entirely if ALL of these hold:**
+- The user explicitly named both the **pipeline** and the **changed value**
+  (e.g. `/transfer fra_em_steering Qwen/Qwen2.5-32B`)
+- A Pipeline class with that name already exists in the project's
+  `pipelines/` directory (check by listing files locally)
+- The project has an `autoresearch.toml`
+- Nothing in the user's request suggests a non-obvious change
+  (e.g. they don't mention "but I want it to use a different dataset" —
+  that's an extra axis you'd need to ask about)
 
-   b. **User's shell env**: try common names from `~/.zshenv` /
-      `~/.bashrc` / current env:
-      ```
-      ! printenv | grep -iE '^(GIT_PAT|GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT)='
-      ```
-      If found, pass its value as `project_repo_token`. **Do not echo the
-      token value in your reply** — confirm "found a PAT in env" and proceed.
+If skipping, jump straight to Phase 2 (Dispatch).
 
-   c. **Conversation context**: scan this conversation for any PAT-like
-      string the user may have mentioned (e.g. they said "my token is in
-      `$MY_PAT`"). Use it if applicable. **Do not paste any literal token
-      value back to the user.**
+**Otherwise, conduct the conversation.** You're trying to fill in five
+fields. Ask only about the ones you can't infer from context:
 
-   d. **Prompt the user**: ask them what env var their PAT lives in (not
-      the token value itself — keep it env-resident):
-      > "I need a GitHub PAT with `repo` scope to clone your private
-      > project. What env var holds it? (e.g. `GIT_PAT`, `GITHUB_TOKEN`)
-      > Or paste the variable *name*, not the value."
-      Then `! printenv $NAME` and pass through.
+| Field | What you're trying to know |
+|---|---|
+| **One-sentence summary** | "You want to take X and run it on Y, right?" Restate to confirm. |
+| **Axis of variation** | What's changing? Pick one or more: model / dataset / measurement / hyperparam / domain. |
+| **What stays fixed** | What's the baseline they're comparing against? (Often implied by "I have results on X" — they want to know if it reproduces on Y.) |
+| **Prerequisites** | Are there resources needed that don't exist yet? (e.g. an SAE for the new model, a dataset for the new domain, a finetune that doesn't exist for the new base.) If yes — that's research work the user has to do, not autoresearch's job. |
+| **Success criterion** | What does "this worked" look like? A number to match? A qualitative behavior? Just exploratory? Helps frame the result. |
 
-   For public repos, skip the whole step — `start_transfer` works without
-   a token.
+Prefer to **infer aggressively** from what they said and the project state
+you can read locally. Each unnecessary question is friction. The 5-question
+cap is a ceiling, not a floor.
 
-2. **Confirm the model arguments.**
-   - `target_model` — the model to run against (e.g. `Qwen/Qwen2.5-32B`). Use
-     full HuggingFace identifiers when possible — the pod loads via `from_pretrained`.
-   - `source_model` (optional) — the model whose existing result we'll compare
-     against in postflight validation. If the user has prior runs for the same
-     pipeline, suggest using one as source. Skip if there's nothing meaningful
-     to compare to.
+**Output of Phase 0**: score the fit as one of three, and tell the user:
 
-3. **Storage tier reminder.** Quietly check the project's pipeline expects the
-   tier conventions (you can ignore this if the user knows what they're doing):
-   - **R2** (`storage` arg in `Pipeline.run`) only for structured outputs you
-     want to compare across runs — scores, summaries.
-   - **Workspace** (`workspace` arg, mounted on the persistent volume) for
-     everything heavy — model weights cache via `HF_HOME`, datasets,
-     intermediate tensors.
-   - **HF Hub** for raw inputs — `from_pretrained` will land caches on the
-     volume automatically.
+- **`fit`** — the project already has a Pipeline class that takes this exact
+  parameter shape; just dispatch. *(Most common when skipping Phase 0.)*
+- **`fit-with-adapter`** — the project's measurement exists but isn't yet
+  wrapped as a Pipeline class, OR the existing Pipeline doesn't expose the
+  axis the user wants to vary. Run `make_compatible` next.
+- **`mismatch`** — autoresearch isn't the right tool for this. Examples:
+  - Prerequisites missing (need to train a new SAE first, no LoRA for the
+    new base model). Recommend they do the prerequisite manually first.
+  - The experiment requires interactive iteration (debugging, deciding what
+    to do next based on intermediate results). autoresearch dispatches
+    deterministic runs; interactive work belongs in a regular notebook.
+  - It's not really a re-run — it's a fresh experiment design. Recommend
+    they prototype manually, then come back when they have a working version
+    to transfer.
 
-4. **Pick a budget.** Default to whatever is in `autoresearch.toml`
-   (`default_budget_usd`). If the run is expected to take many hours, suggest a
-   higher cap so it doesn't stop mid-pipeline. Caps are advisory — the runner
-   hard-stops at the next FSM step after spend crosses the cap.
+**Advisory, not gating.** A `mismatch` score is your recommendation. The
+user can override with something like "do the best you can with it." If they
+do, treat it as a `fit-with-adapter` and proceed; flag the concerns as
+findings the eventual run report should surface.
 
-5. **Dispatch.** Call the MCP tool `start_transfer` with the pipeline name,
-   target model, optional source model, optional `gpu` override, and
-   `budget_usd`. The tool returns a `run_id` and the pod handle.
+---
 
-6. **First-run on a new model takes longer.** HF downloads cache to the
-   persistent volume the first time; subsequent runs on the same volume are
-   warm. Tell the user the first pod boot will likely be 5-15 min before the
-   pipeline even starts running, depending on model size.
+## Phase 1 — Readiness check
 
-7. **What to do next.** Tell the user how to check in:
-   - `summarize_run(run_id)` — server-side LLM digest of progress + findings
-   - `list_findings(run_id)` — raw structured findings
-   - `tail_log(run_id)` — most recent log lines
-   - `takeover(run_id)` — pause at next FSM boundary, get SSH command
-   - `release(run_id)` — resume after takeover
-   - `cancel(run_id)` — terminate pod, mark failed
+Once Phase 0 has scored the fit, verify locally that everything is in place
+to actually dispatch. Run these checks in order; stop at the first one that
+fails and resolve before proceeding.
 
-   If they want to be notified when it finishes, suggest they ask Claude Code
-   to poll `get_run(run_id)` periodically.
+### 1a. Project structure
 
-## When NOT to use this skill
+In the user's project directory:
 
-- The pipeline doesn't exist yet — the user wants you to *write* one. Skip this
-  skill; write the Pipeline class in their `pipelines/` directory first.
-- The user wants to debug a broken pipeline — they should SSH into a pod
-  directly via takeover, not start a new run.
-- The user wants to replicate a paper (write a pipeline from scratch given a
-  paper + claim) — that's the REPLICATE workflow, deferred from v1.
+```
+! ls autoresearch.toml pipelines/ 2>/dev/null
+```
 
-## On budget honesty
+- `autoresearch.toml` present?
+- `pipelines/` directory present?
+- A pipeline class with the matching `name` attribute present?
+  (You can check by inspecting files in `pipelines/` for `name = "..."` lines.)
 
-Budget enforcement is advisory. In-flight LLM tokens and pod-seconds can push
-past the cap. The runner checks budget before each FSM step and stops after the
-step that crosses the cap; it cannot interrupt mid-step. Don't promise hard
-limits when reporting budget back to the user.
+If any of these are missing AND fit-score is `fit`, that's a contradiction —
+re-score as `fit-with-adapter` and run `make_compatible`. If fit-score is
+`fit-with-adapter`, run `make_compatible` now.
+
+### 1b. Git remote check
+
+The pod clones from `project_repo_url`. The repo needs a remote that the
+user has push access to (for any branch the bridge skill creates):
+
+```
+! cd <project-dir> && git remote -v
+```
+
+- Remote configured? If not — autoresearch can't dispatch this project as-is.
+  Tell the user: "Your project needs a git remote (e.g., GitHub) before
+  autoresearch can dispatch it. v1 doesn't support tarball uploads."
+
+### 1c. Required env vars
+
+For private project repos, the controller needs `AUTORESEARCH_PROJECT_REPO_TOKEN`.
+If the controller already has one set (check by reading user's `autoresearch.toml`
+for any indication, OR just try to dispatch and handle the failure), no
+work. If not, discover and pass per-dispatch using the chain:
+
+1. **User's shell env**: try common names from `~/.zshenv` / `~/.bashrc` /
+   current env:
+   ```
+   ! printenv | grep -iE '^(GIT_PAT|GITHUB_TOKEN|GH_TOKEN|GITHUB_PAT)='
+   ```
+   If found, you'll pass its value as `project_repo_token` in the
+   `start_transfer` call. **Do not echo the token value in your reply** —
+   confirm "found a PAT in env" and proceed.
+
+2. **Conversation context**: scan this conversation for any PAT-like string
+   the user may have mentioned (e.g. "my token is in `$MY_PAT`"). Use the
+   variable name they reference. **Do not paste any literal token value back
+   to the user.**
+
+3. **Ask, but only for the env var name** — never ask for the token value
+   directly:
+   > "I need a GitHub PAT with `repo` scope to clone your private project.
+   > What env var holds it? (e.g. `GIT_PAT`, `GITHUB_TOKEN`) — paste the
+   > variable *name*, not the value."
+   Then `! printenv $NAME` and pass through.
+
+Public repos: skip the whole step.
+
+### 1d. Storage tier reminder (advisory)
+
+This is for the pipeline author's awareness — useful to mention if the user
+is writing or adapting a pipeline:
+
+- **R2** (`storage` arg in `Pipeline.run`) → small structured outputs only.
+  Per-layer scores, summary stats. Never large tensors or model dumps.
+- **Workspace** (`workspace` arg, on the persistent volume) → everything
+  heavy. HF caches happen automatically via `HF_HOME`. Pipeline can also
+  write intermediate state here.
+- **HF Hub** → raw inputs. `from_pretrained` lands caches on the volume
+  on first miss.
+
+---
+
+## Phase 2 — Dispatch
+
+By the time you reach Phase 2 you have:
+- A pipeline name that exists in the project's `pipelines/` (or that
+  `make_compatible` just created)
+- Identified `params` (at minimum `target_model`, optionally `source_model`,
+  and any others from the conversation)
+- A budget (default from `autoresearch.toml`, or per-call)
+- A GPU class (default from `autoresearch.toml`, or per-call)
+- Optional: `project_repo_token`, `project_repo_branch` from the readiness
+  check
+
+Call the MCP tool:
+
+```
+start_transfer(
+    pipeline_name = "...",
+    target_model  = "...",
+    source_model  = "...",          # optional
+    gpu           = "...",          # optional, overrides default
+    budget_usd    = ...,            # optional, overrides default
+    project_repo_token = "...",     # optional
+    project_repo_branch = "...",    # optional, from make_compatible
+)
+```
+
+Returns `{run_id, status, pod_handle}`. Confirm to the user:
+
+> "Dispatched run `<id>` on a `<gpu>` pod. First boot will take ~5-15 min
+> (HF model download for first-time use on this volume). You can check in
+> with `summarize_run <id>`, `list_findings <id>`, or `tail_log <id>` from
+> here whenever you want — you don't need to keep this session open."
+
+---
+
+## Mid-flight check-ins
+
+After dispatch, the user may ask "how's it going?" later. Available MCP tools:
+
+- `summarize_run(run_id)` — LLM-summarized digest of progress + findings.
+  Costs Anthropic tokens but is the cleanest single-call status check.
+- `list_findings(run_id)` — raw structured findings, oldest first.
+- `tail_log(run_id, lines=200)` — recent log chunks from the pod.
+- `get_run(run_id)` — full Run record (status, budget, pod handle).
+- `takeover(run_id)` — pause at next FSM boundary, get SSH command. Use when
+  the user wants to debug or inspect the pod directly.
+- `release(run_id)` — resume from takeover.
+- `cancel(run_id)` — terminate pod, mark failed. Use when the user wants to
+  stop a run mid-flight.
+
+---
+
+## Sharp edges to know
+
+### Budget enforcement is advisory
+
+The runner checks budget before each FSM step and hard-stops after the step
+that crosses cap. In-flight tokens or in-flight pod-seconds can push past.
+**Don't promise hard limits** when reporting budget back to the user.
+
+### First-run-on-a-new-model is slow
+
+HF downloads happen on first use per network volume. Qwen-32B is ~60GB.
+The user should expect 5-15 min before the pipeline even starts running on
+a brand-new volume. Subsequent runs on the same volume are warm.
+
+### Takeover is not instant
+
+`takeover` is effective at the next FSM boundary (between phases), not
+mid-step. If the pipeline is mid-`pipeline.run()`, the tool call can't be
+paused — only the next checkpoint transition will honor the takeover.
+
+### When NOT to use this skill
+
+- **Writing a new pipeline from scratch**: skip this skill, write the
+  Pipeline class first, *then* come here.
+- **Interactive debugging**: SSH into a pod via `takeover` directly, not
+  via `/transfer`.
+- **Replicating someone else's paper**: that's the REPLICATE workflow,
+  deferred from v1.
+- **A "what if" question that doesn't have a measurement attached yet**:
+  shape the experiment manually first.
