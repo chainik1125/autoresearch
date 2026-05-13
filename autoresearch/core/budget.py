@@ -1,8 +1,36 @@
 """Budget — advisory spend tracking and cap enforcement.
 
-Budget is checked before each LLM call and before each pod-hour rollover. Enforcement
-is *advisory*, not hard: in-flight tokens or in-flight pod-seconds can push past
-the cap. The contract is "hard-stop at the next checkpoint after spend crosses cap."
+Each Run has `budget_cap_usd` (set at dispatch, default
+`Settings.default_budget_usd = $30`) and `budget_spent_usd` (accumulated as
+the run progresses).
+
+### What's tracked today
+
+  - **Validator LLM calls**: `core.validation.run_validation` charges
+    `ModelResponse.cost_usd` via `add_spend`. Covers the preflight,
+    postflight, and error-summarization calls.
+  - **`summarize_run` MCP tool**: `controller.mcp_surface.summarize_run`
+    charges the same way.
+
+### What's NOT yet tracked (v2 TODOs — see notes/ideas.md)
+
+  - **Hardware advisor** (`core.hardware.recommend` with `client=...`):
+    the call costs ~$0.001-$0.01 each but isn't aggregated into
+    `budget_spent_usd`. Tiny, but should still be tracked for honesty.
+  - **Prep / mechanic / postflight agents** (future): when these land
+    as pod-side Claude Agent SDK loops, every tool-call cycle needs to
+    flow back into `budget_spent_usd` of the parent Run.
+  - **Compute pod-hours**: the pipeline result reports an extrapolated
+    cost based on `cost_per_hour × elapsed`, but the in-flight pod-hour
+    spend is never added to `budget_spent_usd`. So `check()` cannot
+    hard-stop a Run that's blowing its budget on compute, only on LLM.
+    Wiring this up requires the supervisor to poll RunPod for billable
+    seconds and call `add_spend` periodically.
+
+Enforcement is *advisory*, not hard: in-flight tokens or in-flight
+pod-seconds can push past the cap. The contract is "hard-stop at the
+next checkpoint after spend crosses cap" — and only for spend that's
+actually tracked (so currently, only LLM spend).
 """
 
 from __future__ import annotations

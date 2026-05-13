@@ -73,7 +73,12 @@ class Settings(BaseSettings):
     summarize_errors: bool = True
 
     # --- Workflow defaults ---
-    default_budget_usd: float = 50.0
+    # Budget cap per dispatched Run, in USD. Override per-call via the
+    # `budget_usd` arg to start_transfer / CLI `--budget`. The cap covers
+    # all Anthropic spend accumulated via `core.budget.add_spend` for the
+    # life of the run — see budget.py for the spend-tracking semantics
+    # (what IS and isn't tracked yet).
+    default_budget_usd: float = 30.0
     pipeline_module_path: str = "pipelines"
 
     # --- Controller ---

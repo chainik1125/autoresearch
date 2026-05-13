@@ -71,7 +71,12 @@ In the W2S automated researcher, the human-operator surface is a web dashboard (
 4. Run experiments
 
     - Get hardware going
+    - Optionally launch 'mechanic' agents that troubleshoot/babysit the RunPods.
     - 
+
+5. Post-processing
+
+    - Bring together all the results 
 
 
 Note! You will want some meta-optimization agents going: I.e. you may want a pre-experiment layer which determines what the minimum 'time to insight' experiment is. Maybe this is its own stage, maybe a parrallel stage (figuring that out whilst you're running the core experiment), maybe a mid-point-check-in stage.
@@ -80,5 +85,51 @@ Note! You will want some meta-optimization agents going: I.e. you may want a pre
 ## Problems
 
 1. De-risking runs: although technically not an issue for an experiment where you already have a promising result, still seems good practice. Shuld probably make this optional.
+
+
+## v2 TODOs
+
+### Auth / billing
+
+- **Claude Code Max subscription for pod-side agents.** Today every
+  off-laptop Claude call goes through the Anthropic API key (in Railway
+  env), pay-per-token. The local Claude on the laptop runs under your
+  Max subscription. If/when there's a clean way to authenticate the
+  Claude Agent SDK against a Max sub instead of an API key, the prep /
+  mechanic / postflight agents could run on the same flat-rate plan.
+  Current Max auth is OAuth-style tied to interactive sessions; shelling
+  out to `claude -p ...` headless on a pod technically works but is
+  fragile and arguably outside intended use. Track Anthropic's roadmap
+  here.
+
+### Budget accounting
+
+- **Hardware-advisor spend** isn't currently added to
+  `Run.budget_spent_usd`. Tiny ($0.001-$0.01 per call) but should be
+  tracked for honesty. `core.hardware.recommend()` returns the picks +
+  rationale; needs to also surface the LLM cost so the dispatcher can
+  call `budget.add_spend`.
+- **Compute pod-hours not tracked in-flight.** Pipeline result
+  extrapolates a cost from `cost_per_hour × elapsed`, but the
+  in-flight pod-hour spend is never added to `budget_spent_usd`. So
+  `check()` can't hard-stop a Run that's blowing budget on compute,
+  only on LLM. Supervisor would need to poll RunPod billable seconds
+  and call `add_spend` periodically.
+- **Per-Run agent-tree budget rollup.** With `parent_run_id` landed,
+  the natural "budget for this whole tree" is `sum(budget_spent_usd for
+  r in subtree(root))`. Currently each Run has its own cap. A `--tree-
+  budget` flag (or settings.default_tree_budget_usd) would express the
+  user's actual intent: "spend at most $30 across everything spawned
+  by this /transfer."
+
+
+
+## Wishlist
+
+1. 'Debug cycles' in the pre-launch phase. In general, it would be good to have a number of debug cycles (potentially with another model!) before you launch the experiment.
+
+2. Data-tracking. 
+
+Would be really cool to track the data of how often different model choices did best. For example, for the debug cycles, you could imagine at the most basic level having a model injection to look over the code and give you a response (probably CC implements although that model could implement itself if I understand how that works - i.e. call Codex to do it vs. CC and see who does better).
 
 
