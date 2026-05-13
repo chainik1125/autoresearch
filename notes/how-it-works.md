@@ -1,4 +1,4 @@
-# How autoresearch works
+# Mundane autoresearch
 
 A walkthrough of the pipeline, from "you type `/transfer` in Claude Code"
 to "the experiment summary shows up on a branch in your project's git." This
@@ -30,11 +30,13 @@ Server-side:
 
 You see the markdown next time you `git pull` on your laptop, or open
 the branch on GitHub from your phone. The headline is the spend total
-and the outcome. If you want details, the body has them. If it looks
-good, you merge or cherry-pick the result into your paper draft. If it
-looks suspicious, you've still only spent the agreed budget — and the
-findings + log snapshots + git diff of any prep edits are all there to
-diagnose from.
+and the outcome. If you want details, the body has them. The result
+gets reported wherever it would have been reported — bookkeeping in
+the project's results dir, or a figure in the paper if it pans out,
+or a "huh, didn't replicate" note if it doesn't. If something looks
+suspicious, you've still only spent the agreed budget — and the
+findings + log snapshots + git diff of any prep edits are all there
+to diagnose from.
 
 The user-disengaged loop is the core promise: "I've got a promising
 result; help me batch-test it across the variations I'd otherwise spend
