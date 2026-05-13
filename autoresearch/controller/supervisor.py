@@ -90,6 +90,41 @@ class Supervisor:
         long_stale = timedelta(hours=self.settings.supervisor_long_call_stale_hours)
 
         for run in Run.list_all(self.storage):
+            # --- Auto-postflight: when a transfer Run hits terminal status
+            # and the user dispatched it with `auto_postflight=true` in
+            # params, fire start_postflight before reaping its pod. This is
+            # the "chained agents" path: user disengages after the initial
+            # /transfer; transfer pod runs (hours); supervisor sees it
+            # complete and spawns postflight. Postflight does its work, then
+            # this same cleanup pass reaps its pod too.
+            if (
+                run.status in _TERMINAL_STATUSES
+                and run.workflow == "transfer"
+                and (run.params or {}).get("auto_postflight")
+                and not (run.params or {}).get("postflight_run_id")
+            ):
+                try:
+                    pf = dispatcher.dispatch_new(
+                        workflow="postflight",
+                        pipeline_name="postflight",
+                        params={
+                            "target_run_id": run.id,
+                            "project_repo_url": run.params.get("project_repo_url"),
+                            "project_repo_branch": run.params.get("project_repo_branch"),
+                        },
+                        budget_usd=self.settings.default_budget_usd,
+                        settings=self.settings,
+                        storage=self.storage,
+                        compute=self.compute,
+                        required_vram_gb=8,  # smallest fitting GPU; postflight is mostly text + git
+                        parent_run_id=run.id,
+                    )
+                    run.params["postflight_run_id"] = pf.id
+                    run.save(self.storage)
+                    _log.info("run %s terminal; auto-dispatched postflight as %s", run.id, pf.id)
+                except Exception:  # noqa: BLE001 -- best-effort; reap pod regardless
+                    _log.exception("failed to auto-dispatch postflight for %s", run.id)
+
             # --- Cleanup: terminate pods of terminal-status Runs --------
             if run.status in _TERMINAL_STATUSES and run.pod_handle:
                 try:

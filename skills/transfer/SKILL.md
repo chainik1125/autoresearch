@@ -10,9 +10,24 @@ does in a related setup — same code on a different model, same model on a
 different dataset, same dataset with a different measurement, etc.
 "TRANSFER" is the broad category of "run the thing again but vary one axis."
 
-Your job has four phases. Move through them in order; **don't dispatch
+Your job has FIVE phases. Move through them in order; **don't dispatch
 before completing Phase 1 and 2**, and **don't run make_compatible before
 completing Phase 0** unless the call is unambiguous (see the skip rule).
+
+**The full chain you orchestrate:**
+
+```
+Phase 0  intent discovery (you + user)
+Phase 1  recommend_hardware (you call MCP, surface to user)
+Phase 2  start_prepare → poll until COMPLETED → read findings → abort on blockers
+Phase 3  readiness check (local file checks)
+Phase 4  start_transfer with auto_postflight=true → user disengages
+[server] transfer pod runs; supervisor auto-fires start_postflight at terminal state
+[server] postflight pod writes experiment_summary.md, pushes to user's repo, then reaps
+```
+
+The user disengages after Phase 4. Prep and postflight are real Runs with
+their own findings — readable any time via `list_findings(run_id)`.
 
 ---
 
@@ -112,12 +127,61 @@ to relax (DC, VRAM floor, wait for inventory).
 
 ---
 
-## Phase 2 — Readiness check
+## Phase 2 — Prepare (`start_prepare`)
+
+Now that you know what you're dispatching and on what hardware, fire the
+prep agent BEFORE the main compute dispatch. Prep is a cheap (~$0.05),
+quick (~5 min) static review on a small pod that catches the predictable
+class of "won't survive an off-laptop dispatch" bugs: hardcoded paths,
+missing env vars, dependency issues.
+
+### Call
+
+```
+prep = start_prepare(
+    pipeline_name      = "...",
+    target_model       = "...",
+    intent             = "<from Phase 0>",
+    project_repo_url   = "...",
+    project_repo_branch = "...",
+    project_repo_token = "...",     # if private
+    params             = {...},     # the full params dict you'll pass to start_transfer
+)
+```
+
+Returns `{run_id, status, pod_handle}`. Status is `queued`.
+
+### Wait for it
+
+Poll `get_run(prep.run_id)` every 30s. Status will go `queued → running →
+completed` or `failed`. Typically <10 min. While waiting, tell the user
+what you're doing — don't go silent.
+
+### Read the review
+
+```
+findings = list_findings(prep.run_id)
+```
+
+Look for the `prepare` OBSERVATION finding. Either:
+
+- **`OK: looks fine, dispatch as-is`** → proceed to Phase 3.
+- **Bullets with blockers** → tell the user what was flagged, in plain
+  language. If the blockers are mechanical (e.g. hardcoded /root/ path
+  the prep agent proposed to symlink, missing env var), confirm with the
+  user that those are OK to live with, then proceed. If they're
+  substantive (e.g. dataset doesn't exist, code won't run on the target
+  model), tell the user to fix or abort.
+
+Prep agent runs in plan-mode in v0 — it reports blockers but doesn't
+apply patches. v1 will add a confirm-and-apply path.
+
+## Phase 3 — Readiness check (local)
 
 Verify locally that everything is in place to dispatch. Stop at the first
 failing check.
 
-### 2a. Project structure
+### 3a. Project structure
 
 ```
 ! ls autoresearch.toml pipelines/ 2>/dev/null
@@ -130,7 +194,7 @@ failing check.
 If any is missing AND fit-score is `fit`, re-score as `fit-with-adapter`
 and run `make_compatible`.
 
-### 2b. Git remote check
+### 3b. Git remote check
 
 ```
 ! cd <project-dir> && git remote -v
@@ -139,7 +203,7 @@ and run `make_compatible`.
 If no remote, tell the user: "Your project needs a git remote before
 autoresearch can dispatch. v0.1 doesn't support tarball uploads."
 
-### 2c. Required env vars (private repos only)
+### 3c. Required env vars (private repos only)
 
 If `project_repo_url` points at a private repo, the controller needs a
 GitHub PAT. Discovery chain:
@@ -152,7 +216,7 @@ GitHub PAT. Discovery chain:
 
 Public repos: skip this whole step.
 
-### 2d. Storage tier reminder (advisory)
+### 3d. Storage tier reminder (advisory)
 
 For pipeline authors:
 - **R2** (`storage` arg) → small structured outputs only (per-layer scores,
@@ -162,9 +226,9 @@ For pipeline authors:
 
 ---
 
-## Phase 3 — Dispatch
+## Phase 4 — Dispatch
 
-By Phase 3 you have:
+By Phase 4 you have:
 - A pipeline name that exists in the project
 - `params` (at minimum `target_model`; everything else pipeline-specific)
 - A hardware choice from Phase 1 (either `picks` list or user override)
@@ -178,12 +242,17 @@ start_transfer(
     pipeline_name      = "...",
     target_model       = "...",                    # convenience shorthand, goes into params
     source_model       = "...",                    # optional convenience shorthand
-    params             = {...},                    # arbitrary pipeline-specific params
+    params             = {
+        ...,                                       # arbitrary pipeline-specific keys
+        "auto_postflight": True,                   # DEFAULT for /transfer: fire postflight
+                                                   #   automatically when transfer hits a
+                                                   #   terminal state. Skip only if the user
+                                                   #   explicitly says "no summary report"
+    },
     gpu                = picks,                    # from recommend_hardware OR user override
     required_vram_gb   = <num>,                    # optional; lets the controller re-rank
                                                    #   if `gpu` list goes dry
-    intent             = "...",                    # from Phase 0 — useful if the
-                                                   #   controller falls back to recommend()
+    intent             = "...",                    # from Phase 0
     budget_usd         = ...,                      # optional
     project_repo_url   = "...",                    # ALWAYS pass from autoresearch.toml
     project_repo_branch = "...",                   # pass when make_compatible made a branch
@@ -196,9 +265,19 @@ If you omit it, the pod inherits the controller's default (typically stale).
 
 Returns `{run_id, status, pod_handle}`. Confirm to the user:
 
-> "Dispatched run `<id>` on a `<gpu>` pod. First boot ~5-15 min if HF
-> model download is fresh. Check in with `summarize_run <id>` or
-> `list_findings <id>` anytime; you don't need to keep this session open."
+> "Dispatched transfer run `<id>` on a `<gpu>` pod. First boot ~5-15 min
+> if HF model download is fresh.
+>
+> The chain from here is server-side — you can close your laptop:
+>   1. Transfer runs (hours)
+>   2. When it hits terminal state, the supervisor auto-dispatches the
+>      postflight agent (~10 min)
+>   3. Postflight writes `experiment_summary.md` and pushes it to
+>      `autoresearch/results-<id>` on your project repo
+>
+> Check in any time with `summarize_run <id>`, `list_findings <id>`, or
+> by pulling the results branch on your laptop. The pods reap themselves
+> when their work is done."
 
 ---
 
