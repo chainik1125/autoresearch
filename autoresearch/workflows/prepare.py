@@ -1,60 +1,33 @@
-"""PREPARE workflow — pre-flight review + auto-apply mechanical patches.
+"""PREPARE workflow — pre-flight code review with REAL Claude Code on the pod.
 
-Runs before the actual compute dispatch. Reads the cloned project repo,
-the target Pipeline class, and the user's intent. Identifies blockers,
-categorizes each into MECHANICAL (auto-applied) or USER-INPUT-NEEDED
-(flag-and-abort). Commits applied patches to a new branch and pushes;
-transfer's prep gate (in workflows/transfer.py) checks out that branch
-before running.
+Runs as a headless Claude Code session via `claude-agent-sdk`. The agent has
+Read / Edit / Write / Bash / Glob / Grep tools and `cwd` set to the cloned
+project repo on the persistent volume. Default outcome is still "no edits"
+— most projects are fine. When the agent does find a fix, it applies it
+directly via the Edit tool; we then `git status`, commit, and push to
+`autoresearch/prepared-<run_id>` so the transfer pod's gate can check it out.
 
-### What v0 does
+### What's different from the prior v0
 
-  1. Single-shot LLM call. Asks Claude to emit a structured JSON plan:
-     `{verdict, rationale, patches: [{file, find, replace, reason}],
-       user_input_blockers: [...]}`
-  2. If `verdict == "user_input_needed"` or any blocker present: write
-     LOUD [USER-INPUT-NEEDED] findings and exit (no patches applied).
-     Transfer's gate sees the [USER-INPUT-NEEDED] tag and aborts.
-  3. If `verdict == "patches_applied"`: deterministic Python applies
-     each `find`/`replace` to the named file (verbatim text match). If
-     any patch's `find` text isn't found in the file, abort patching —
-     don't apply partial sets. Then `git checkout -b
-     autoresearch/prepared-<run_id> && git commit && git push`.
-  4. If `verdict == "ok"`: no patches, no branch, no findings.
+  - **Real tools.** Multi-file edits, file creation, import smoke tests are
+    all possible — they were not in the JSON-only version.
+  - **No JSON contract.** The agent doesn't have to express patches as
+    structured find/replace. It just edits.
+  - **Audit trail is `git diff`.** The committed branch shows exactly what
+    changed. Plus the SDK's tool-call stream becomes a finding so you can
+    see what tools were used + with what inputs.
 
-The patch application is deterministic Python, not LLM tool-use. That
-means every change is auditable from the agent's JSON output + the git
-diff. Trade-off: the agent has to express patches as exact-text find/
-replace, which is less flexible than Edit-tool calls but much easier to
-audit. v1 trajectory: switch to Claude Agent SDK with the Edit tool
-for cases where verbatim find/replace isn't enough.
+### What stays the same
 
-### What's still v1
-
-  - Multi-file refactors that don't fit verbatim find/replace
-  - Adding new files (today: edit-existing only)
-  - System-level changes (apt install, system symlinks) — though we
-    could special-case symlink instructions since the Arditi case
-    showed they're common
-
-### Concrete prior example
-
-  Arditi's `run_from_config.py` references
-  `/root/git/dictionary_learning/data/misaligned_aggregated.jsonl`.
-  Our pod clones to `/workspace/arditi_dl/...`. A future project that
-  hardcodes `/root/git/<repo>/...` should yield a [MECHANICAL] patch
-  that either edits the path OR adds an `os.symlink` call in the
-  appropriate setup file. (The Arditi case itself is already handled
-  by the fra_proj wrapper's `_ensure_hardcoded_symlink()` — that's a
-  wrapper-level fix, not a code edit. The prep agent should recognize
-  the SHAPE of the problem and propose the appropriate fix.)
+  - Default outcome: "no edits, dispatch as-is."
+  - User-input-needed escalation: agent prints `[USER-INPUT-NEEDED]` and
+    halts (does NOT push); transfer's gate detects the tag and aborts.
+  - Only edits inside the cloned project root (`cwd=/workspace/project`).
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -62,203 +35,106 @@ from typing import Any
 from autoresearch.backends.models.base import ModelClient
 from autoresearch.backends.storage import StorageBackend
 from autoresearch.core import findings as findings_mod
-from autoresearch.core.agent_runner import run_agent
+from autoresearch.core.agent_runner import run_agent_with_tools
 from autoresearch.core.findings import FindingType
 from autoresearch.core.run import Run, RunStatus
 
 
-PREP_SYSTEM = """You are a research-engineering reviewer doing pre-flight static
-analysis of a project that's about to be dispatched onto a GPU pod, off the
-researcher's laptop. They're going to disengage as soon as the dispatch fires.
+PREP_SYSTEM = """You are headless Claude Code doing pre-flight review of a
+research project that's about to be dispatched onto a GPU pod. The
+researcher is offline; whatever you decide is final until their next
+check-in.
 
-YOUR DEFAULT IS "no changes needed." Most projects are fine as-is — don't
-invent issues to look helpful.
+YOUR DEFAULT IS "no edits, ready to dispatch." Most projects are fine.
 
-When you DO find something, categorize it:
+If you find a problem, categorize it:
 
-  - **MECHANICAL** — can be fixed by exact-text find-and-replace in a file
-    without asking the user. The deterministic post-step will apply each
-    patch verbatim. Patches must be specific enough that the `find` text
-    appears EXACTLY ONCE in the named file. Examples:
-      * Hardcoded absolute paths in source code (`/root/...`, `/home/...`,
-        `/Users/...`, `/tmp/<user-specific>`). Patch them to use env vars
-        or relative-to-workspace paths.
-      * Missing/wrong torch+torchvision pin (we hit this on Qwen-32B —
-        torch was upgraded but torchvision wasn't, ABI mismatch). Patch
-        requirements.txt to also pin the matching torchvision.
-      * Missing apt/pip deps that imports will choke on. Patch the
-        requirements.txt.
+  **MECHANICAL** — you can fix it yourself, right now, by editing files in
+  the cwd. Use Read / Glob / Grep to find context, Edit / Write to make
+  changes, Bash to verify (e.g. `python -c "import sae_lens"` after a
+  requirements edit). Examples:
+    - Hardcoded absolute paths in source (`/root/...`, `/home/...`,
+      `/Users/...`, `/tmp/<user-specific>`) — patch to env-var or
+      workspace-relative.
+    - Missing or wrong dep pins (e.g. torch upgraded but torchvision left
+      unpinned — we've hit this on Qwen-32B). Patch requirements.txt.
+    - Concrete worked example from earlier work: Arditi's
+      run_from_config.py hardcodes
+      /root/git/dictionary_learning/data/misaligned_aggregated.jsonl —
+      their checkout lives elsewhere on our pod. The wrapper-level fix is
+      a symlink. Recognize the SHAPE: any hardcoded path with a username,
+      hostname, or `/root/<repo>` prefix.
 
-    Concrete worked example we've handled: Arditi's `run_from_config.py`
-    references `/root/git/dictionary_learning/data/misaligned_aggregated.jsonl`.
-    Their clone lives at `/workspace/arditi_dl/...` on our pod. (The
-    Arditi case itself is handled by our wrapper's symlink — recognize
-    the SHAPE: any hardcoded absolute path that won't exist on the pod.)
+  **USER-INPUT-NEEDED** — only the researcher can decide. DO NOT EDIT.
+  Print one line starting with `[USER-INPUT-NEEDED]` per blocker, then
+  stop. Examples:
+    - Ambiguous intent (two reasonable interpretations).
+    - License / scope / cost decisions.
+    - Anything the local Phase-1.5 checklist should have caught — note
+      this in the blocker text so the checklist can grow.
 
-  - **USER-INPUT-NEEDED** — only the user can decide. Don't patch.
-    Examples:
-      * Two reasonable interpretations of intent.
-      * Token / license / scope decisions.
-      * Anything where the local Phase-1.5 checklist should have asked
-        but didn't (the checklist needs to grow — note it in the
-        blocker text so future iterations of the checklist absorb it).
+  If you have BOTH mechanical fixes AND user-input blockers, set the
+  user-input track only: print [USER-INPUT-NEEDED], do NOT edit. (Partial
+  fixes confuse the audit trail. Resolution: researcher resolves blocker,
+  re-dispatches, prep applies the mechanical fixes on the next pass.)
 
-Output ONE JSON object (no prose, no code fences). Schema:
+OUTPUT FORMAT:
 
-{
-  "verdict":   "ok" | "patches_applied" | "user_input_needed",
-  "rationale": "<one short sentence>",
-  "patches":   [
-    {
-      "file":    "<path relative to project root>",
-      "find":    "<exact text to find — must appear exactly once in the file>",
-      "replace": "<exact replacement text>",
-      "reason":  "<short justification>"
-    }
-  ],
-  "user_input_blockers": ["<one sentence per blocker>"]
-}
+  - If no edits needed: end with one line `OK: ready to dispatch` and one
+    short sentence on what you confirmed.
+  - If you applied mechanical edits: end with one line summary
+    `EDITED: <N> files` and a one-line per-file changelog.
+  - If user-input-needed: end with one or more
+    `[USER-INPUT-NEEDED] <one-line description>` lines and nothing else.
 
-- `verdict=ok` → empty `patches` and `user_input_blockers`.
-- `verdict=patches_applied` → 1+ patches, empty blockers, all MECHANICAL.
-- `verdict=user_input_needed` → 0+ patches (will be ignored), 1+ blockers.
-
-If you have both mechanical patches AND user-input blockers, set
-`verdict=user_input_needed` (we don't apply partial fixes when the user
-also needs to weigh in). Resolution: report blockers, user resolves,
-re-dispatch."""
+Be terse. The researcher will read this on their next check-in."""
 
 
-PREP_USER_TEMPLATE = """Project under review:
+PREP_USER_TEMPLATE = """Project under review (cwd is the project root, with
+the dispatch branch checked out):
 
-- Repo URL: {project_repo_url}
-- Branch:   {project_repo_branch}
-- Pipeline: {pipeline_name}
-- Target:   {target_model}
-- Intent:   {intent}
+  - Pipeline: {pipeline_name}
+  - Target model: {target_model}
+  - Researcher's intent: {intent}
+  - Branch: {project_repo_branch}
 
-Pipeline params: {params_json}
+Use Glob/Grep/Read to inspect. If you spot a MECHANICAL issue, fix it via
+Edit/Write and verify if you can (Bash). If only the researcher can
+decide, emit [USER-INPUT-NEEDED] and stop.
 
-Project tree (depth=3, files only — first 100 entries):
-{project_tree}
-
-Key file excerpts (the pipeline class + the entrypoint script if findable):
-{file_excerpts}
-
-Apply the system-prompt's review rules. Return the JSON object."""
+Defer to your system prompt for output format.
+"""
 
 
-# --- file discovery + LLM-prompt prep --------------------------------------
-
-
-def _list_project_tree(repo_root: Path, max_entries: int = 100) -> str:
-    out: list[str] = []
+def _run_git(cmd: list[str], cwd: Path) -> tuple[int, str]:
     try:
-        for p in sorted(repo_root.rglob("*"))[:max_entries]:
-            if p.is_file():
-                out.append(str(p.relative_to(repo_root)))
-    except Exception:  # noqa: BLE001
-        return "(failed to list project tree)"
-    return "\n".join(out) if out else "(empty)"
-
-
-def _read_excerpt(path: Path, max_chars: int = 4000) -> str:
-    try:
-        body = path.read_text(errors="ignore")
-        return body[:max_chars] + ("\n...[truncated]" if len(body) > max_chars else "")
-    except Exception:  # noqa: BLE001
-        return f"(could not read {path})"
-
-
-# --- LLM-output parsing + patch application -------------------------------
-
-
-def _parse_plan(text: str) -> dict[str, Any] | None:
-    """Best-effort JSON extraction. Tolerates ``` fences and stray prose."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```", 2)[1]
-        if text.startswith("json"):
-            text = text[4:]
-        text = text.rsplit("```", 1)[0].strip()
-    try:
-        d = json.loads(text)
-        if isinstance(d, dict):
-            return d
-    except json.JSONDecodeError:
-        pass
-    # Last-resort: find the outermost {...} block in the text.
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            d = json.loads(m.group(0))
-            if isinstance(d, dict):
-                return d
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def _apply_patch(repo_root: Path, patch: dict[str, Any]) -> tuple[bool, str]:
-    """Apply one patch via verbatim find/replace. Returns (success, message)."""
-    fname = patch.get("file", "")
-    find = patch.get("find", "")
-    replace = patch.get("replace", "")
-    if not (fname and find):
-        return False, "patch missing file or find"
-    fpath = (repo_root / fname).resolve()
-    # Guard against path traversal — keep edits inside the repo.
-    try:
-        fpath.relative_to(repo_root.resolve())
-    except ValueError:
-        return False, f"patch path {fname!r} is outside the project root; refusing"
-    if not fpath.exists():
-        return False, f"file not found: {fname}"
-    body = fpath.read_text(errors="ignore")
-    count = body.count(find)
-    if count == 0:
-        return False, f"find-text not present in {fname}"
-    if count > 1:
-        return False, f"find-text matches {count} sites in {fname}; refusing ambiguous patch"
-    fpath.write_text(body.replace(find, replace, 1))
-    return True, f"patched {fname} (1 site)"
-
-
-def _run(cmd: list[str], cwd: Path) -> tuple[int, str]:
-    try:
-        p = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, check=False)
+        p = subprocess.run(
+            cmd, cwd=str(cwd), capture_output=True, text=True, check=False,
+        )
         return p.returncode, (p.stdout + p.stderr)[-1000:]
     except Exception as e:  # noqa: BLE001
         return 99, str(e)
 
 
 def _commit_and_push(repo_root: Path, branch: str, run_id: str) -> tuple[bool, str]:
-    """Best-effort: commit the applied patches and push the prepared branch.
-
-    Uses PROJECT_REPO_TOKEN from env for HTTPS auth. Skips silently if there's
-    no remote or no token configured.
-    """
+    """git checkout -B + add -A + commit + push. Uses PROJECT_REPO_TOKEN."""
     if not (repo_root / ".git").exists():
         return False, f"no .git at {repo_root}"
-    _run(["git", "config", "user.email", "autoresearch@noreply.local"], repo_root)
-    _run(["git", "config", "user.name", "autoresearch"], repo_root)
-    rc1, _ = _run(["git", "checkout", "-B", branch], repo_root)
-    rc2, _ = _run(["git", "add", "-A"], repo_root)
-    rc3, out3 = _run([
+    _run_git(["git", "config", "user.email", "autoresearch@noreply.local"], repo_root)
+    _run_git(["git", "config", "user.name", "autoresearch"], repo_root)
+    _run_git(["git", "checkout", "-B", branch], repo_root)
+    _run_git(["git", "add", "-A"], repo_root)
+    rc_c, out_c = _run_git([
         "git", "commit", "-m",
-        f"autoresearch: mechanical prep patches for run {run_id}",
+        f"autoresearch: prep agent edits for run {run_id}",
     ], repo_root)
     token = os.environ.get("PROJECT_REPO_TOKEN")
-    _, remote_url = _run(["git", "remote", "get-url", "origin"], repo_root)
+    _, remote_url = _run_git(["git", "remote", "get-url", "origin"], repo_root)
     if token and remote_url.startswith("https://"):
         auth_url = remote_url.replace("https://", f"https://{token}@", 1).strip()
-        _run(["git", "remote", "set-url", "origin", auth_url], repo_root)
-    rc4, out4 = _run(["git", "push", "-u", "origin", branch], repo_root)
-    ok = rc4 == 0
-    return ok, f"checkout rc={rc1}; commit rc={rc3} {out3[-200:]}; push rc={rc4} {out4[-200:]}"
-
-
-# --- entry point ----------------------------------------------------------
+        _run_git(["git", "remote", "set-url", "origin", auth_url], repo_root)
+    rc_p, out_p = _run_git(["git", "push", "-u", "origin", branch], repo_root)
+    return rc_p == 0, f"commit rc={rc_c} {out_c[-200:]}; push rc={rc_p} {out_p[-200:]}"
 
 
 def prepare(
@@ -266,99 +142,64 @@ def prepare(
     *,
     storage: StorageBackend,
     workspace: Path,
-    model_client: ModelClient,
+    model_client: ModelClient,        # unused; SDK uses env-side ANTHROPIC_API_KEY directly
     project_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Single-shot review → apply mechanical patches → commit + push.
-
-    Returns a result dict including `prepared_branch` (set when patches were
-    applied + pushed) so transfer's prep gate can `git checkout` it.
-    """
+    """Run the prep agent (headless CC). If it makes edits, push them."""
     project_root = project_root or (workspace / "project")
-    pipeline_name = run.pipeline_name
     params = run.params or {}
-    target = params.get("target_model", "—")
-    intent = params.get("intent", "(none provided)")
-
-    excerpts: list[str] = []
-    pipeline_file = project_root / "pipelines" / f"{pipeline_name}.py"
-    if pipeline_file.exists():
-        excerpts.append(f"--- pipelines/{pipeline_name}.py ---\n{_read_excerpt(pipeline_file)}")
-    reqs = project_root / "requirements.txt"
-    if reqs.exists():
-        excerpts.append(f"--- requirements.txt ---\n{_read_excerpt(reqs, max_chars=2000)}")
 
     user = PREP_USER_TEMPLATE.format(
-        project_repo_url=params.get("project_repo_url", "—"),
+        pipeline_name=run.pipeline_name,
+        target_model=params.get("target_model", "—"),
+        intent=params.get("intent", "(none provided)"),
         project_repo_branch=params.get("project_repo_branch", "—"),
-        pipeline_name=pipeline_name,
-        target_model=target,
-        intent=intent,
-        params_json=json.dumps(params, default=str),
-        project_tree=_list_project_tree(project_root),
-        file_excerpts="\n\n".join(excerpts) if excerpts else "(no excerpts available)",
     )
 
-    agent = run_agent(
-        run=run, storage=storage, client=model_client,
-        system=PREP_SYSTEM, user=user, max_tokens=2000, label="prepare",
+    agent = run_agent_with_tools(
+        run=run, storage=storage,
+        system=PREP_SYSTEM, user=user,
+        cwd=project_root,
+        allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
+        max_turns=30,
+        label="prepare",
     )
-    plan = _parse_plan(agent.text)
 
-    # Output bookkeeping
-    applied: list[str] = []
-    failed: list[str] = []
+    # Categorize outcome from the agent's final-answer text.
+    text = agent.text or ""
+    user_input_needed = "[USER-INPUT-NEEDED]" in text
     prepared_branch: str | None = None
 
-    if plan is None:
+    if user_input_needed:
         findings_mod.append(
-            storage, run, FindingType.OBSERVATION,
-            "[USER-INPUT-NEEDED] prep agent's output did not parse as JSON. "
-            f"Raw output:\n{agent.text[:2000]}",
+            storage, run, FindingType.ERROR,
+            f"![USER-INPUT-NEEDED] prep agent halted; see prep finding above. "
+            f"Transfer will abort at the gate.",
         )
         verdict = "user_input_needed"
     else:
-        verdict = plan.get("verdict", "ok")
-        blockers = plan.get("user_input_blockers") or []
-        for b in blockers:
-            # Loud user-input findings — leading "!" sorts them to the top.
-            findings_mod.append(
-                storage, run, FindingType.ERROR,
-                f"![USER-INPUT-NEEDED] {b}",
-            )
-
-        if verdict == "patches_applied" and not blockers:
-            patches = plan.get("patches") or []
-            for p in patches:
-                ok, msg = _apply_patch(project_root, p)
-                tag = "applied" if ok else "FAILED"
-                line = f"[MECHANICAL] {tag}: {p.get('file')} — {p.get('reason')}: {msg}"
-                findings_mod.append(storage, run, FindingType.OBSERVATION, line)
-                (applied if ok else failed).append(line)
-            if failed:
-                # Don't push partial sets. Tell the user.
+        # Check working tree for edits the agent made. If any, push.
+        rc, out = _run_git(["git", "status", "--porcelain"], project_root)
+        has_changes = bool(out.strip()) and rc == 0
+        if has_changes:
+            branch = f"autoresearch/prepared-{run.id}"
+            ok, msg = _commit_and_push(project_root, branch, run.id)
+            if ok:
+                prepared_branch = branch
+                findings_mod.append(
+                    storage, run, FindingType.OBSERVATION,
+                    f"[MECHANICAL] pushed `{branch}` with prep edits. "
+                    f"Transfer's gate will check this out before running.",
+                )
+                verdict = "patches_applied"
+            else:
                 findings_mod.append(
                     storage, run, FindingType.ERROR,
-                    "![USER-INPUT-NEEDED] some prep patches failed to apply; "
-                    "not pushing branch. See preceding findings.",
+                    f"![USER-INPUT-NEEDED] prep edits made locally but git push failed: {msg}",
                 )
                 verdict = "user_input_needed"
-            elif applied:
-                branch = f"autoresearch/prepared-{run.id}"
-                ok, msg = _commit_and_push(project_root, branch, run.id)
-                if ok:
-                    prepared_branch = branch
-                    findings_mod.append(
-                        storage, run, FindingType.OBSERVATION,
-                        f"[MECHANICAL] pushed `{branch}` ({len(applied)} patches). "
-                        f"Transfer will check this out before running.",
-                    )
-                else:
-                    findings_mod.append(
-                        storage, run, FindingType.ERROR,
-                        f"![USER-INPUT-NEEDED] patches applied locally but push failed: {msg}",
-                    )
-                    verdict = "user_input_needed"
+        else:
+            verdict = "ok"
 
     fresh = Run.load(storage, run.id)
     fresh.status = RunStatus.COMPLETED
@@ -366,8 +207,7 @@ def prepare(
     return {
         "workflow": "prepare",
         "verdict": verdict,
-        "patches_applied": applied,
-        "patches_failed": failed,
         "prepared_branch": prepared_branch,
+        "tool_calls": len(agent.tool_calls),
         "cost_usd": agent.cost_usd,
     }

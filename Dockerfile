@@ -13,7 +13,14 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # git is needed for the pod entrypoint's optional `PROJECT_REPO_URL` clone.
 # hf-transfer accelerates HF Hub downloads when HF_HUB_ENABLE_HF_TRANSFER=1.
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# nodejs + @anthropic-ai/claude-code give us a headless `claude` CLI on the
+# pod so the prep / postflight workflows can drive a real Claude Agent SDK
+# loop via the `claude-agent-sdk` Python package (which shells out to the
+# CLI under the hood).
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir hf-transfer
 

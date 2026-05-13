@@ -1,66 +1,179 @@
-"""Agent runner — wraps a single LLM call for the prep / mechanic / postflight workflows.
+"""Agent runner — drive a real headless Claude Code loop on the pod.
 
-v0: this is a single-shot `client.complete()` call wrapped in our standard
-finding-emission + budget-charging machinery. NOT a Claude Agent SDK tool-using
-loop yet — that's v1. The point of v0 is to land the workflow scaffolding so
-each agent type has a real home, and the system prompts have a single grep-able
-location to iterate on.
+This is the wrapper the prep / postflight workflows use to run a real
+`claude-agent-sdk` query — i.e. a *headless Claude Code session* running on
+the RunPod pod, with the user's project repo as cwd. The agent has the same
+Read/Edit/Write/Bash/Glob/Grep tools you'd get from interactive Claude Code
+on your laptop. Edits land in the cloned project on the volume, and git
+sees them through `git diff` like any other change.
 
-### Why single-shot is OK for v0
+Why not just one `client.complete()`? Because the limitations show up
+immediately for the prep case:
+  - multi-file edits don't fit a single verbatim find/replace
+  - file creation (adding a missing dep file) isn't expressible
+  - import-smoke-tests (`python -c "import sae_lens"`) need Bash
+  - the model needs to read several files before deciding what to fix
 
-  - Prep: most projects have at most 2-3 machine-specific assumptions to flag
-    (hardcoded paths, env vars). A single carefully-prompted call can list them.
-    Applying patches is v1 (needs the tool-using loop + plan-mode UX).
-  - Mechanic: opt-in, fires once at compute start. "Does this run look likely
-    to succeed?" One call.
-  - Postflight: one call to produce the experiment_summary.md. Writing files
-    + git operations are subprocess steps the workflow does after the LLM
-    call (not via the agent's tool use).
+The SDK fixes all of those. The cost is ~$0.10-1 per agent run (vs
+~$0.01-0.05 single-shot) and an async-to-sync bridge.
 
-### v1 trajectory (notes/ideas.md)
+### Public API
 
-Replace `client.complete()` here with a Claude Agent SDK `query()` that has
-the Read/Edit/Bash toolset enabled. Each workflow's system prompt + max_turns
-+ allowed tools become configuration on this runner.
+  - `run_agent_with_tools(...)` — real CC. Use this for prep, postflight,
+    or anything that needs filesystem tools.
+  - `run_agent_single_shot(...)` — one `ModelClient.complete()` call. Use
+    for mechanic or anything that's just "read findings + judge."
+
+Both charge the Run's budget, emit an OBSERVATION finding with the agent's
+final answer, and return an `AgentResult`.
+
+### Auth
+
+The SDK uses `ANTHROPIC_API_KEY` from env, which `secrets.env_for_run`
+already injects into every pod. No new auth surface to wire.
+
+### Permission mode
+
+We use `bypassPermissions` because the pod is the sandbox — we trust the
+agent to do whatever it needs in /workspace, and there's no interactive
+human to grant per-tool-call permissions.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
-from autoresearch.backends.models.base import ModelClient
 from autoresearch.backends.storage import StorageBackend
 from autoresearch.core import budget, findings
 from autoresearch.core.findings import FindingType
 from autoresearch.core.run import Run
 
+if TYPE_CHECKING:
+    from autoresearch.backends.models.base import ModelClient
+
 
 @dataclass
 class AgentResult:
-    """What `run_agent` returns to the calling workflow."""
-
     text: str
     cost_usd: float
-    input_tokens: int
-    output_tokens: int
+    num_turns: int = 0
+    tool_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
 
-def run_agent(
+# ---------------------------------------------------------------------------
+# Real CC loop via claude-agent-sdk
+# ---------------------------------------------------------------------------
+
+
+async def _query_with_tools(
+    *,
+    system: str,
+    user: str,
+    cwd: Path,
+    allowed_tools: list[str],
+    max_turns: int,
+) -> tuple[str, float, int, list[tuple[str, dict[str, Any]]]]:
+    # Import inside the function so the SDK isn't required for tests that
+    # only exercise the single-shot path.
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ClaudeAgentOptions,
+        ResultMessage,
+        TextBlock,
+        ToolUseBlock,
+        query,
+    )
+
+    options = ClaudeAgentOptions(
+        system_prompt=system,
+        cwd=str(cwd),
+        allowed_tools=allowed_tools,
+        max_turns=max_turns,
+        permission_mode="bypassPermissions",
+    )
+
+    final_text = ""
+    cost_usd = 0.0
+    num_turns = 0
+    tool_calls: list[tuple[str, dict[str, Any]]] = []
+
+    async for msg in query(prompt=user, options=options):
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    # Keep the most recent assistant text — the SDK delivers
+                    # one final text turn after tool use is done.
+                    final_text = block.text
+                elif isinstance(block, ToolUseBlock):
+                    tool_calls.append((block.name, block.input))
+        elif isinstance(msg, ResultMessage):
+            cost_usd = msg.total_cost_usd or 0.0
+            num_turns = msg.num_turns
+            if msg.result:
+                final_text = msg.result
+
+    return final_text, cost_usd, num_turns, tool_calls
+
+
+def run_agent_with_tools(
     *,
     run: Run,
     storage: StorageBackend,
-    client: ModelClient,
+    system: str,
+    user: str,
+    cwd: Path,
+    allowed_tools: list[str],
+    max_turns: int = 30,
+    label: str = "agent",
+) -> AgentResult:
+    """Run a headless CC loop and emit findings + charge the budget.
+
+    The agent's filesystem effects are NOT captured here — they're whatever
+    landed in `cwd` (and visible via `git diff` if it's a repo). Callers
+    that want to act on those effects (commit, push, etc.) inspect the
+    working directory after this returns.
+    """
+    final_text, cost_usd, num_turns, tool_calls = asyncio.run(
+        _query_with_tools(
+            system=system, user=user, cwd=cwd,
+            allowed_tools=allowed_tools, max_turns=max_turns,
+        )
+    )
+    if cost_usd > 0:
+        budget.add_spend(storage, run, cost_usd)
+    tool_summary = ", ".join(name for name, _ in tool_calls[:20]) or "no tool use"
+    body = (
+        f"=== {label} === ({num_turns} turns, {len(tool_calls)} tool calls, "
+        f"${cost_usd:.4f})\n"
+        f"tools used: {tool_summary}\n\n"
+        f"{final_text}"
+    )
+    findings.append(storage, run, FindingType.OBSERVATION, body)
+    return AgentResult(
+        text=final_text, cost_usd=cost_usd,
+        num_turns=num_turns, tool_calls=tool_calls,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Single-shot LLM call (mechanic still uses this — no tools needed)
+# ---------------------------------------------------------------------------
+
+
+def run_agent_single_shot(
+    *,
+    run: Run,
+    storage: StorageBackend,
+    client: "ModelClient",
     system: str,
     user: str,
     max_tokens: int = 2000,
     label: str = "agent",
 ) -> AgentResult:
-    """Run one LLM call, charge the Run's budget, emit a finding with the output.
-
-    `label` shows up in the finding body so a later `list_findings` reader can
-    tell prep vs mechanic vs postflight apart without parsing the rest of the
-    text.
-    """
+    """One `ModelClient.complete()` call; no tool use."""
     resp = client.complete(system=system, user=user, max_tokens=max_tokens)
     if resp.cost_usd > 0:
         budget.add_spend(storage, run, resp.cost_usd)
@@ -68,9 +181,9 @@ def run_agent(
         storage, run, FindingType.OBSERVATION,
         f"=== {label} ===\n{resp.text}",
     )
-    return AgentResult(
-        text=resp.text,
-        cost_usd=resp.cost_usd,
-        input_tokens=resp.input_tokens,
-        output_tokens=resp.output_tokens,
-    )
+    return AgentResult(text=resp.text, cost_usd=resp.cost_usd)
+
+
+# Backwards-compat alias for the original `run_agent` name used elsewhere.
+# Resolves to single-shot since that was the v0 behavior.
+run_agent = run_agent_single_shot

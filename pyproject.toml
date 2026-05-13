@@ -10,6 +10,7 @@ authors = [{ name = "Dmitry Manning-Coe" }]
 dependencies = [
     "anthropic>=0.40",
     "boto3>=1.35",
+    "claude-agent-sdk>=0.1",   # headless CC for prep / mechanic / postflight agents
     "fastapi>=0.115",
     "httpx>=0.27",
     "mcp>=1.2",
