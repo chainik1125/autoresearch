@@ -42,20 +42,47 @@ _PREP_WAIT_TIMEOUT_S = 20 * 60   # 20 minutes
 _PREP_POLL_INTERVAL_S = 15
 
 
+def _checkout_prepared_branch(workspace: Path, branch: str) -> tuple[bool, str]:
+    """`git fetch && git checkout <branch>` in the cloned project on the volume.
+
+    Best-effort: if anything fails, returns False with a message so the gate
+    can record a finding and proceed (or abort, caller's choice).
+    """
+    import subprocess
+    project_root = workspace / "project"
+    if not (project_root / ".git").exists():
+        return False, f"no .git at {project_root}"
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin", branch], cwd=str(project_root),
+            capture_output=True, text=True, check=True, timeout=60,
+        )
+        subprocess.run(
+            ["git", "checkout", branch], cwd=str(project_root),
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+    except subprocess.SubprocessError as e:
+        return False, f"git checkout {branch} failed: {e}"
+    return True, f"checked out {branch}"
+
+
 def _wait_for_prep_gate(
     storage: StorageBackend,
     run: Run,
+    workspace: Path,
     prep_run_id: str,
 ) -> bool:
     """Block until prep is terminal; return True iff transfer should proceed.
 
-    Returns False (abort) when prep's findings contain `[USER-INPUT-NEEDED]`
-    — the prep agent surfaced something only the user can resolve, and we
-    shouldn't burn compute on training that may need to be discarded.
+    Three outcomes:
+      - prep findings contain `[USER-INPUT-NEEDED]` → ABORT (return False),
+        write ERROR finding, set FAILED status. User resolves manually.
+      - prep produced a `prepared_branch` (mechanical patches applied + pushed)
+        → check it out in /workspace/project and proceed.
+      - prep is clean / no patches → proceed on the current branch.
 
-    On timeout: writes a finding noting that prep didn't complete in time
-    and returns True (proceed anyway — better to do the work than to fail a
-    transfer because a prep call hung).
+    On timeout: log + proceed (best-effort; better to do the work than to
+    fail a transfer because a prep call hung).
     """
     deadline = time.monotonic() + _PREP_WAIT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -91,6 +118,25 @@ def _wait_for_prep_gate(
                 )
                 fresh.save(storage)
                 return False
+
+            # If prep applied + pushed mechanical patches, switch our project
+            # checkout to the prepared branch before running.
+            try:
+                prep_result = json.loads(
+                    storage.read(prep.result_key).decode("utf-8")
+                )
+            except Exception:  # noqa: BLE001
+                prep_result = {}
+            prepared_branch = prep_result.get("prepared_branch")
+            if prepared_branch:
+                ok, msg = _checkout_prepared_branch(workspace, prepared_branch)
+                findings_mod.append(
+                    storage, run, FindingType.OBSERVATION,
+                    f"prep gate: prep applied patches → "
+                    + ("checked out " if ok else "FAILED to check out ")
+                    + f"`{prepared_branch}` ({msg})",
+                )
+
             findings_mod.append(
                 storage, run, FindingType.OBSERVATION,
                 f"prep gate: prep run `{prep_run_id}` clean — proceeding",
@@ -364,7 +410,7 @@ def transfer(
         # training cost on a run that needs human input.
         prep_run_id = (run.params or {}).get("wait_for_prep_run_id")
         if prep_run_id:
-            if not _wait_for_prep_gate(storage, run, prep_run_id):
+            if not _wait_for_prep_gate(storage, run, workspace, prep_run_id):
                 return {"aborted_by_prep_gate": True, "prep_run_id": prep_run_id}
 
         hooks = WorkflowHooks(
