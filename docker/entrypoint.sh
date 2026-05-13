@@ -69,10 +69,21 @@ for candidate in "${WORKSPACE}/project/requirements.txt" "${WORKSPACE}/pipelines
     if [[ -f "$candidate" ]]; then REQ_FILE="$candidate"; break; fi
 done
 MARKER="${WORKSPACE}/.cache/requirements-installed.marker"
+PIP_LOG="${WORKSPACE}/.cache/pip-install.log"
 if [[ -n "$REQ_FILE" ]] && [[ ! -f "$MARKER" ]]; then
-    echo "[entrypoint] one-time pip install -r $REQ_FILE (volume cache)"
-    pip install --cache-dir "$PIP_CACHE_DIR" -r "$REQ_FILE"
-    echo "$REQ_FILE" > "$MARKER"
+    echo "[entrypoint] one-time pip install -r $REQ_FILE (volume cache; log -> $PIP_LOG)"
+    # Don't let an individual package resolution failure restart-loop the pod.
+    # We capture the rc, write a marker either way so we don't redo this on every
+    # restart, and let `autoresearch run` surface any missing-dep ImportError as
+    # a proper FAILED finding in R2 (visible from MCP) instead of a silent loop.
+    set +e
+    pip install --cache-dir "$PIP_CACHE_DIR" -r "$REQ_FILE" 2>&1 | tee "$PIP_LOG"
+    PIP_RC=${PIPESTATUS[0]}
+    set -e
+    echo "{\"req\": \"$REQ_FILE\", \"rc\": $PIP_RC, \"finished_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$MARKER"
+    if [[ $PIP_RC -ne 0 ]]; then
+        echo "[entrypoint] WARN: pip install exit $PIP_RC; continuing so runner can report a clean error"
+    fi
 fi
 
 if [[ -z "${RUN_ID:-}" ]]; then
