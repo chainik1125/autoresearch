@@ -20,6 +20,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import time
+
 from autoresearch.backends.models.base import ModelClient
 from autoresearch.backends.storage import StorageBackend
 from autoresearch.backends.storage.base import KeyNotFound
@@ -29,7 +31,79 @@ from autoresearch.core.findings import FindingType
 from autoresearch.core.heartbeat import HeartbeatWriter
 from autoresearch.core.pipeline import Pipeline
 from autoresearch.core.pipeline_runner import RunnerContext, WorkflowHooks, run_pipeline
-from autoresearch.core.run import Run
+from autoresearch.core.run import Run, RunStatus
+
+
+# When transfer dispatches a prep agent in parallel, transfer pauses at the
+# top of its workflow until prep is terminal. Cap how long we'll wait so a
+# stuck prep doesn't trap the transfer pod forever — at the cap, we proceed
+# (best-effort) and log a finding.
+_PREP_WAIT_TIMEOUT_S = 20 * 60   # 20 minutes
+_PREP_POLL_INTERVAL_S = 15
+
+
+def _wait_for_prep_gate(
+    storage: StorageBackend,
+    run: Run,
+    prep_run_id: str,
+) -> bool:
+    """Block until prep is terminal; return True iff transfer should proceed.
+
+    Returns False (abort) when prep's findings contain `[USER-INPUT-NEEDED]`
+    — the prep agent surfaced something only the user can resolve, and we
+    shouldn't burn compute on training that may need to be discarded.
+
+    On timeout: writes a finding noting that prep didn't complete in time
+    and returns True (proceed anyway — better to do the work than to fail a
+    transfer because a prep call hung).
+    """
+    deadline = time.monotonic() + _PREP_WAIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        try:
+            prep = Run.load(storage, prep_run_id)
+        except Exception:  # noqa: BLE001 -- prep run missing; proceed
+            findings_mod.append(
+                storage, run, FindingType.OBSERVATION,
+                f"prep gate: could not load prep run {prep_run_id}; proceeding without gate",
+            )
+            return True
+
+        if prep.status in (RunStatus.COMPLETED, RunStatus.FAILED):
+            prep_findings = findings_mod.list_findings(storage, prep)
+            blockers = [
+                f for f in prep_findings
+                if "[USER-INPUT-NEEDED]" in (f.body or "")
+            ]
+            if blockers:
+                summary = "; ".join((f.body or "")[:200] for f in blockers[:3])
+                findings_mod.append(
+                    storage, run, FindingType.ERROR,
+                    "ABORTED by prep gate: prep run "
+                    f"`{prep_run_id}` surfaced user-input-needed blockers "
+                    f"and the user is not engaged. Resolve in conversation + "
+                    f"redispatch.\n\nBlockers (first 3):\n{summary}",
+                )
+                fresh = Run.load(storage, run.id)
+                fresh.status = RunStatus.FAILED
+                fresh.last_error = (
+                    f"prep gate aborted run: prep {prep_run_id} flagged "
+                    "[USER-INPUT-NEEDED]"
+                )
+                fresh.save(storage)
+                return False
+            findings_mod.append(
+                storage, run, FindingType.OBSERVATION,
+                f"prep gate: prep run `{prep_run_id}` clean — proceeding",
+            )
+            return True
+        time.sleep(_PREP_POLL_INTERVAL_S)
+
+    findings_mod.append(
+        storage, run, FindingType.OBSERVATION,
+        f"prep gate: prep run `{prep_run_id}` did not finish within "
+        f"{_PREP_WAIT_TIMEOUT_S}s; proceeding anyway",
+    )
+    return True
 
 
 PREFLIGHT_SYSTEM = """You are a research-engineering assistant validating a measurement run.
@@ -283,6 +357,16 @@ def transfer(
 
     result: dict[str, Any] | None = None
     try:
+        # Optional prep gate. If the dispatch passed `params.wait_for_prep_run_id`,
+        # block here until that prep Run is terminal. Abort with a clear
+        # finding if prep surfaced [USER-INPUT-NEEDED] blockers — better to
+        # eat ~$0.10 of "transfer pod sat waiting" than to burn the full
+        # training cost on a run that needs human input.
+        prep_run_id = (run.params or {}).get("wait_for_prep_run_id")
+        if prep_run_id:
+            if not _wait_for_prep_gate(storage, run, prep_run_id):
+                return {"aborted_by_prep_gate": True, "prep_run_id": prep_run_id}
+
         hooks = WorkflowHooks(
             preflight=_preflight_hook(model_client, storage) if preflight else None,
             postflight=_postflight_hook(model_client, storage) if postflight else None,

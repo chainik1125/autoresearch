@@ -170,12 +170,13 @@ After Phase 1.5, you have:
 - Confirmed scope (branch, backend choice, budget)
 - The user's heads-up on heavy first-time downloads
 
-## Phase 2 — Prepare (`start_prepare`) — fire-and-forget
+## Phase 2 — Prepare (`start_prepare`) — fire-and-forget, gated
 
-Dispatch the prep agent. **Do NOT wait** for it before dispatching
-transfer — that's the point of having prep run off-laptop. The prep
-agent's findings will land in `list_findings(prep.run_id)`; the user (or
-a continuation agent) can read them later if needed.
+Dispatch the prep agent. **Do NOT wait** for it on the laptop — but the
+TRANSFER pod will wait for it on the server side via the prep gate.
+That closes the race: if prep surfaces a `[USER-INPUT-NEEDED]` blocker,
+transfer aborts before doing any heavy work, so we don't waste compute
+on a run that's going to be thrown away.
 
 ### Call
 
@@ -191,9 +192,10 @@ prep = start_prepare(
 )
 ```
 
-Returns `{run_id, status, pod_handle}`. Note the `run_id` — tell the user
-"prep dispatched as `<id>`; check `list_findings <id>` later if you want
-to see the review." Then immediately proceed to Phase 3.
+Returns `{run_id, status, pod_handle}`. **Capture the `run_id` — you
+pass it as `params["wait_for_prep_run_id"]` in Phase 4 so the transfer
+pod waits on it.** Tell the user: "prep dispatched as `<id>`; transfer
+will gate on it before any heavy compute." Then proceed to Phase 3.
 
 ### Why not wait
 
@@ -209,11 +211,16 @@ goal is blown. The prep agent's findings are:
   needs to grow; in the meantime, the prep agent halts and writes a
   finding. The user notices on their next check-in and decides.
 
-The prep agent runs in parallel with the transfer dispatch in v0. If
-prep surfaces a fatal issue after transfer starts, the user can cancel
-the transfer Run when they notice. (v1 trajectory: have transfer wait
-on prep's all-clear before starting the actual training, so the
-race is closed without blocking the laptop.)
+The prep agent runs in parallel with the transfer dispatch. The race
+is closed server-side: transfer's first step is to wait for prep (see
+`wait_for_prep_run_id` in Phase 4). If prep surfaces a
+`[USER-INPUT-NEEDED]` blocker, transfer aborts with a FAILED finding
+before model load. The "wasted" cost is just the transfer pod sitting
+idle for ~5 min (~$0.10-0.50). Worth it.
+
+Postflight, when it fires, will see the FAILED transfer and write a
+summary that surfaces the prep blocker in the headline so the user
+notices on their next check-in.
 
 ## Phase 3 — Local readiness check (FAST file existence)
 
@@ -287,6 +294,11 @@ start_transfer(
                                                    #   automatically when transfer hits a
                                                    #   terminal state. Skip only if the user
                                                    #   explicitly says "no summary report"
+        "wait_for_prep_run_id": prep.run_id,       # the prep dispatch from Phase 2 — transfer
+                                                   #   pod waits here for prep's all-clear
+                                                   #   before doing any heavy compute. If
+                                                   #   prep finds [USER-INPUT-NEEDED],
+                                                   #   transfer aborts with a FAILED finding
     },
     gpu                = picks,                    # from recommend_hardware OR user override
     required_vram_gb   = <num>,                    # optional; lets the controller re-rank

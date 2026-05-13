@@ -50,6 +50,13 @@ Categorize each finding you produce as ONE of:
     asking the user. The user has already disengaged. Examples:
       * Hardcoded absolute paths (`/root/...`, `/home/...`, `/Users/...`,
         project-specific tmp dirs) — propose a symlink or env-var-aware rewrite.
+        Worked example we hit live: Arditi's `run_from_config.py` references
+        `/root/git/dictionary_learning/data/misaligned_aggregated.jsonl`. Their
+        clone lives at `/workspace/arditi_dl/...` on our pod. The fix is a
+        symlink `/root/git/dictionary_learning -> /workspace/arditi_dl`. The
+        wrapper in fra_proj's `fra/train_sae_arditi.py` does this in its
+        `_ensure_hardcoded_symlink()`. Recognize this pattern: any hardcoded
+        path with a username, hostname, or `/root/<repo>` shape.
       * Missing data files referenced by hardcoded paths — propose creating
         them from a downloadable HF Hub source if you can identify one.
       * Quirky module-level imports that need `sys.path` tweaks.
