@@ -23,7 +23,9 @@ from typing import Any
 from autoresearch.backends.models.base import ModelClient
 from autoresearch.backends.storage import StorageBackend
 from autoresearch.backends.storage.base import KeyNotFound
+from autoresearch.core import findings as findings_mod
 from autoresearch.core import validation
+from autoresearch.core.findings import FindingType
 from autoresearch.core.heartbeat import HeartbeatWriter
 from autoresearch.core.pipeline import Pipeline
 from autoresearch.core.pipeline_runner import RunnerContext, WorkflowHooks, run_pipeline
@@ -126,6 +128,107 @@ def _postflight_hook(client: ModelClient, storage: StorageBackend):
     return hook
 
 
+def _build_experiment_report(
+    run: Run, pipeline_result: dict[str, Any] | None
+) -> str:
+    """Markdown experiment-report body. Headline carries the spend total.
+
+    Designed to be readable both as a finding (via `list_findings`) and as a
+    standalone `experiment_summary.md` file written into the workspace.
+    """
+    llm_spent = run.budget_spent_usd
+    cap = run.budget_cap_usd
+    under = (cap <= 0) or (llm_spent <= cap)
+
+    compute_estimate: float | None = None
+    elapsed_s: float | None = None
+    if isinstance(pipeline_result, dict):
+        elapsed_s = pipeline_result.get("elapsed_seconds")
+        if "actual_run_cost_usd" in pipeline_result:
+            compute_estimate = pipeline_result.get("actual_run_cost_usd")
+        elif elapsed_s and "cost_per_hour" in (run.params or {}):
+            compute_estimate = (elapsed_s / 3600.0) * float(run.params["cost_per_hour"])
+
+    total_est = llm_spent + (compute_estimate or 0.0)
+    compute_str = (
+        f"${compute_estimate:.4f} (elapsed {elapsed_s:.0f}s × cost_per_hour)"
+        if compute_estimate is not None else "not tracked"
+    )
+    budget_state = "under" if under else "**EXCEEDED**"
+
+    target = (run.params or {}).get("target_model", "—")
+
+    lines: list[str] = [
+        f"# /transfer {run.id} — {run.status.value.upper()}",
+        "",
+        f"**Total spend (est.): ${total_est:.4f}** "
+        f"— LLM ${llm_spent:.4f} + compute {compute_str}. "
+        f"Budget cap ${cap:.2f} ({budget_state}).",
+        "",
+        "## Pipeline",
+        f"- name: `{run.pipeline_name}`",
+        f"- target_model: `{target}`",
+        f"- params: `{json.dumps(run.params, default=str)}`",
+    ]
+    if run.parent_run_id:
+        lines.append(f"- parent_run_id: `{run.parent_run_id}`")
+    if run.pod_handle:
+        lines.append(f"- pod_handle: `{run.pod_handle}`")
+
+    if isinstance(pipeline_result, dict):
+        lines.extend(["", "## Result", "```json", json.dumps(pipeline_result, indent=2, default=str), "```"])
+    elif run.last_error:
+        lines.extend(["", "## Error", "```", run.last_error, "```"])
+
+    lines.extend([
+        "",
+        "## Spend accounting",
+        f"- Tracked LLM spend: `${llm_spent:.4f}` (validators + summarize_run)",
+        f"- Compute spend est: `{compute_str}`",
+        f"- **Total est: `${total_est:.4f}`** vs cap `${cap:.2f}` ({budget_state})",
+        "",
+        "_Compute pod-hours are not yet tracked in-flight — the estimate above is",
+        "post-hoc from the pipeline's `elapsed_seconds` × `cost_per_hour`, not from",
+        "RunPod billing. Hardware-advisor + future agent spend isn't aggregated yet._",
+        "See `notes/ideas.md` → v2 TODOs (Budget accounting).",
+    ])
+    return "\n".join(lines)
+
+
+def _write_spend_summary(
+    storage: StorageBackend,
+    run_id: str,
+    pipeline_result: dict[str, Any] | None,
+    workspace: Path | None = None,
+) -> None:
+    """Emit the markdown experiment report at terminal state (COMPLETED/FAILED).
+
+    Two artifacts:
+      1. An OBSERVATION finding with the full markdown body — readable via
+         `list_findings(run_id)` from anywhere.
+      2. `<workspace>/experiment_summary.md` on the persistent volume —
+         co-located with training.log + SAE outputs for the user to grab
+         when they SSH in or pull artifacts. Best-effort; absence of
+         workspace just skips the file write.
+
+    Both are best-effort — a failure here must never mask the real run result.
+    """
+    try:
+        fresh = Run.load(storage, run_id)
+    except Exception:  # noqa: BLE001
+        return
+    body = _build_experiment_report(fresh, pipeline_result)
+    try:
+        findings_mod.append(storage, fresh, FindingType.OBSERVATION, body)
+    except Exception:  # noqa: BLE001
+        pass
+    if workspace is not None:
+        try:
+            (Path(workspace) / "experiment_summary.md").write_text(body)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _error_hook(client: ModelClient, storage: StorageBackend):
     def hook(run: Run, exc: BaseException) -> str:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -178,6 +281,7 @@ def transfer(
         long_call_start = lambda _r: hb.set_long_call(True)  # noqa: E731
         long_call_end = lambda _r: hb.set_long_call(False)   # noqa: E731
 
+    result: dict[str, Any] | None = None
     try:
         hooks = WorkflowHooks(
             preflight=_preflight_hook(model_client, storage) if preflight else None,
@@ -187,8 +291,16 @@ def transfer(
             on_long_call_end=long_call_end,
         )
         ctx = RunnerContext(storage=storage, workspace=workspace, hooks=hooks)
-        return run_pipeline(run, pipeline, ctx)
+        result = run_pipeline(run, pipeline, ctx)
+        return result
     finally:
+        # Lightweight bolt-on: always emit a spend_summary finding at the
+        # terminal state of a /transfer (success OR failure). Wrapped in
+        # try/except so a bad spend write never masks the real result/error.
+        try:
+            _write_spend_summary(storage, run.id, result, workspace=workspace)
+        except Exception:  # noqa: BLE001 -- spend summary is best-effort
+            pass
         if hb is not None:
             hb.stop()
             hb.join(timeout=2.0)

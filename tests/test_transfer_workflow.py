@@ -61,8 +61,14 @@ def test_transfer_no_validators(tmp_path: Path) -> None:
     assert Run.load(storage, run.id).status == RunStatus.COMPLETED
 
     fs = findings.list_findings(storage, run)
-    # Only the auto-written result finding; no LLM-driven observations.
-    assert [f.type for f in fs] == [FindingType.RESULT]
+    # Auto-written result finding + the spend_summary bolt-on (always emitted
+    # at terminal state). No LLM-driven observations since validators are off.
+    assert [f.type for f in fs] == [FindingType.RESULT, FindingType.OBSERVATION]
+    # Spend summary is a markdown experiment report with the spend in headline.
+    assert fs[-1].body.startswith("# /transfer ")
+    assert "Total spend (est.)" in fs[-1].body
+    # Also written as a file in the workspace.
+    assert (workspace / "experiment_summary.md").exists()
 
 
 def test_transfer_with_fake_validators(tmp_path: Path) -> None:
@@ -97,9 +103,16 @@ def test_transfer_with_fake_validators(tmp_path: Path) -> None:
 
     fs = findings.list_findings(storage, run)
     types = [f.type for f in fs]
-    assert types == [FindingType.OBSERVATION, FindingType.RESULT, FindingType.OBSERVATION]
+    # preflight obs + result + postflight obs + spend_summary obs (bolt-on).
+    assert types == [
+        FindingType.OBSERVATION, FindingType.RESULT,
+        FindingType.OBSERVATION, FindingType.OBSERVATION,
+    ]
     assert fs[0].body == "looks good"
     assert fs[2].body == "looks good"
+    # Spend summary is always last and contains the markdown headline.
+    assert fs[3].body.startswith("# /transfer ")
+    assert "Total spend (est.)" in fs[3].body
 
 
 def test_transfer_requires_client_when_validators_enabled(tmp_path: Path) -> None:
