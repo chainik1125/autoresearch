@@ -50,6 +50,9 @@ def env_for_run(
         # AUTORESEARCH_ prefix matches Settings.model_config.env_prefix so the
         # pod's Settings.load() actually reads this.
         "AUTORESEARCH_PIPELINE_MODULE_PATH": "/workspace/pipelines",
+        # Pipeline workspace lives on the network volume so logs and
+        # intermediate state survive pod restarts (cli.py reads this).
+        "WORKSPACE_DIR": "/workspace",
 
         "AUTORESEARCH_STORAGE": settings.storage,
         "AUTORESEARCH_STORAGE_BUCKET": settings.storage_bucket or "",

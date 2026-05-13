@@ -68,6 +68,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.run_id:
         run = Run.load(storage, args.run_id)
+        # If a prior pod attempt already drove this run to a terminal state,
+        # exit cleanly so RunPod's container-restart-on-non-zero-exit doesn't
+        # respawn us into a fast loop that re-runs the failed pipeline forever.
+        from autoresearch.core.run import RunStatus as _RS
+        if run.status in (_RS.FAILED, _RS.COMPLETED):
+            print(
+                f"run {run.id} already in terminal state {run.status.value}; "
+                f"exiting 0 so the pod can be cleaned up without retry.",
+                file=sys.stderr,
+            )
+            return 0
         workflow = run.workflow
         pipeline_name = run.pipeline_name
         print(
