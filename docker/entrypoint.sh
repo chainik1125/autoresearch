@@ -68,19 +68,19 @@ REQ_FILE=""
 for candidate in "${WORKSPACE}/project/requirements.txt" "${WORKSPACE}/pipelines/requirements.txt"; do
     if [[ -f "$candidate" ]]; then REQ_FILE="$candidate"; break; fi
 done
-MARKER="${WORKSPACE}/.cache/requirements-installed.marker"
 PIP_LOG="${WORKSPACE}/.cache/pip-install.log"
-if [[ -n "$REQ_FILE" ]] && [[ ! -f "$MARKER" ]]; then
-    echo "[entrypoint] one-time pip install -r $REQ_FILE (volume cache; log -> $PIP_LOG)"
-    # Don't let an individual package resolution failure restart-loop the pod.
-    # We capture the rc, write a marker either way so we don't redo this on every
-    # restart, and let `autoresearch run` surface any missing-dep ImportError as
-    # a proper FAILED finding in R2 (visible from MCP) instead of a silent loop.
+if [[ -n "$REQ_FILE" ]]; then
+    # We used to gate pip install on a marker file living on the volume, on the
+    # theory that "install once per volume" amortized cost across pod boots.
+    # That was wrong: the volume persists but the container's site-packages does
+    # NOT, so a fresh pod with a stale marker would skip install and crash on
+    # ImportError. Always install; the on-volume pip cache at $PIP_CACHE_DIR
+    # makes re-runs fast (~30-60s wheels-from-cache vs ~5min cold).
+    echo "[entrypoint] pip install -r $REQ_FILE (cache: $PIP_CACHE_DIR; log -> $PIP_LOG)"
     set +e
     pip install --cache-dir "$PIP_CACHE_DIR" -r "$REQ_FILE" 2>&1 | tee "$PIP_LOG"
     PIP_RC=${PIPESTATUS[0]}
     set -e
-    echo "{\"req\": \"$REQ_FILE\", \"rc\": $PIP_RC, \"finished_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$MARKER"
     if [[ $PIP_RC -ne 0 ]]; then
         echo "[entrypoint] WARN: pip install exit $PIP_RC; continuing so runner can report a clean error"
     fi
