@@ -75,6 +75,7 @@ async def _query_with_tools(
     cwd: Path,
     allowed_tools: list[str],
     max_turns: int,
+    max_budget_usd: float,
 ) -> tuple[str, float, int, list[tuple[str, dict[str, Any]]]]:
     # Import inside the function so the SDK isn't required for tests that
     # only exercise the single-shot path.
@@ -92,6 +93,7 @@ async def _query_with_tools(
         cwd=str(cwd),
         allowed_tools=allowed_tools,
         max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
         permission_mode="bypassPermissions",
     )
 
@@ -127,9 +129,17 @@ def run_agent_with_tools(
     cwd: Path,
     allowed_tools: list[str],
     max_turns: int = 30,
+    max_budget_usd: float = 10.0,
     label: str = "agent",
 ) -> AgentResult:
     """Run a headless CC loop and emit findings + charge the budget.
+
+    `max_budget_usd` is a per-invocation hard cap enforced by the SDK
+    itself — when this single agent invocation crosses the threshold it
+    stops mid-loop. Defaults to $10/agent; workflows override if they need
+    a different ceiling. This is the safety belt against a runaway agent;
+    the Run-level `budget_cap_usd` is the outer envelope for the whole
+    workflow (LLM + future compute).
 
     The agent's filesystem effects are NOT captured here — they're whatever
     landed in `cwd` (and visible via `git diff` if it's a repo). Callers
@@ -140,6 +150,7 @@ def run_agent_with_tools(
         _query_with_tools(
             system=system, user=user, cwd=cwd,
             allowed_tools=allowed_tools, max_turns=max_turns,
+            max_budget_usd=max_budget_usd,
         )
     )
     if cost_usd > 0:

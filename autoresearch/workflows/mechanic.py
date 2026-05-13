@@ -109,6 +109,18 @@ def mechanic(
         + f"\n\nLog tail (last 200 lines):\n```\n{log_tail or '(empty)'}\n```\n"
     )
 
+    # Mechanic is single-shot (no tool loop). Cost is naturally bounded by
+    # max_tokens=1000 — worst case ~$0.10. We don't wire SDK's max_budget_usd
+    # because there's no tool loop to cap, but we still honor a $10 envelope
+    # at the Run level: if the Run has already spent more than that on prior
+    # calls, refuse to proceed.
+    from autoresearch.core import budget
+    _MECHANIC_BUDGET_CAP = 10.0
+    if Run.load(storage, run.id).budget_spent_usd >= _MECHANIC_BUDGET_CAP:
+        raise RuntimeError(
+            f"mechanic refused: Run {run.id} has already spent more than "
+            f"the per-agent cap of ${_MECHANIC_BUDGET_CAP:.2f}"
+        )
     agent = run_agent(
         run=run, storage=storage, client=model_client,
         system=MECHANIC_SYSTEM, user=user, max_tokens=1000, label="mechanic",

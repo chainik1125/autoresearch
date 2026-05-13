@@ -162,6 +162,7 @@ def prepare(
         cwd=project_root,
         allowed_tools=["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
         max_turns=30,
+        max_budget_usd=10.0,
         label="prepare",
     )
 

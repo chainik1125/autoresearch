@@ -183,6 +183,7 @@ def postflight(
         cwd=project_root,
         allowed_tools=["Read", "Write", "Bash"],
         max_turns=20,
+        max_budget_usd=10.0,
         label="postflight",
     )
 
