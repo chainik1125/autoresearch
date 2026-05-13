@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     default_budget_usd: float = 30.0
     pipeline_module_path: str = "pipelines"
 
+    # --- End-of-run notification (postflight pod pings this) ---
+    # Generic webhook URL. Provider is auto-detected from the URL (ntfy.sh,
+    # Slack webhook, Discord webhook), or override via `notification_provider`.
+    # Set to None to skip notifications. Examples:
+    #   notification_url = "https://ntfy.sh/dmitry-autoresearch"
+    #   notification_url = "https://hooks.slack.com/services/..."
+    # The postflight workflow posts a one-line headline (status + spend +
+    # link to the results branch on the user's repo) at run completion.
+    notification_url: str | None = None
+    notification_provider: str | None = None   # "ntfy" | "slack" | "discord" | "generic_post"
+
     # --- Controller ---
     controller_url: str | None = None
     controller_public_url: str | None = None

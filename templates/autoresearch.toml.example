@@ -31,6 +31,18 @@ runpod_default_image = "your-registry/autoresearch:dev"   # built from this repo
 default_budget_usd = 30
 pipeline_module_path = "pipelines"             # where your Pipeline classes live
 
+# --- End-of-run notification (optional) ---
+# Postflight pings this URL with the run's headline. Provider is
+# auto-detected from URL (ntfy.sh, Slack webhook, Discord webhook), or
+# override with `notification_provider`.
+#
+# Easiest: install ntfy app on your phone, subscribe to a topic, and:
+# notification_url = "https://ntfy.sh/dmitry-autoresearch"
+#
+# Slack:
+# notification_url = "https://hooks.slack.com/services/T0000/B0000/X"
+# notification_provider = "slack"
+
 # --- Validation (bounded LLM calls) ---
 preflight = true                               # "is this model name + GPU choice sane?"
 postflight = true                              # "does the result look plausible vs. source?"

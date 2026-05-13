@@ -35,7 +35,9 @@ from typing import Any
 
 from autoresearch.backends.models.base import ModelClient
 from autoresearch.backends.storage import StorageBackend
+from autoresearch.config import Settings
 from autoresearch.core import findings as findings_mod
+from autoresearch.core import notify
 from autoresearch.core.agent_runner import run_agent_with_tools
 from autoresearch.core.findings import FindingType
 from autoresearch.core.run import Run, RunStatus
@@ -192,6 +194,33 @@ def postflight(
     pushed = "pushed" in agent.text.lower() or expected_md.exists()
     branch = f"autoresearch/results-{target_run_id}"
 
+    # Best-effort: ping the user's notification webhook if configured.
+    # Loaded inline so we pick up env-var overrides on the pod (notification_url
+    # comes from autoresearch.toml or AUTORESEARCH_NOTIFICATION_URL).
+    notified = False
+    try:
+        settings = Settings.load()
+        if settings.notification_url:
+            headline = (
+                f"{target.status.value.upper()} — spent "
+                f"${target.budget_spent_usd:.2f} of ${target.budget_cap_usd:.2f}. "
+                f"Results: autoresearch/results-{target_run_id}" if pushed
+                else f"{target.status.value.upper()} — spent ${target.budget_spent_usd:.2f}. (summary push failed; see findings)"
+            )
+            notified = notify.send_notification(
+                url=settings.notification_url,
+                title=f"autoresearch /transfer {target_run_id}",
+                message=headline,
+                provider=settings.notification_provider,
+            )
+            findings_mod.append(
+                storage, run, FindingType.OBSERVATION,
+                f"notification → {settings.notification_provider or 'auto'}: "
+                + ("sent" if notified else "FAILED (see logs)"),
+            )
+    except Exception:  # noqa: BLE001 -- notification must never break postflight
+        pass
+
     fresh = Run.load(storage, run.id)
     fresh.status = RunStatus.COMPLETED
     fresh.save(storage)
@@ -209,6 +238,7 @@ def postflight(
         "summary_pushed": pushed,
         "summary_branch": branch if pushed else None,
         "summary_path": str(expected_md) if expected_md.exists() else None,
+        "notification_sent": notified,
         "tool_calls": len(agent.tool_calls),
         "cost_usd": agent.cost_usd,
     }
