@@ -1,16 +1,44 @@
 # How autoresearch works
 
-A walkthrough of the v1 pipeline, from "you type `/transfer` in Claude Code" to
-"findings show up in R2." This doc is the foundation for building cleaner
-abstractions on top — once you understand which pieces own what, the right APIs
-become obvious.
+A walkthrough of the pipeline, from "you type `/transfer` in Claude Code"
+to "the experiment summary shows up on a branch in your project's git." This
+doc is the foundation for building cleaner abstractions on top — once you
+understand which pieces own what, the right APIs become obvious.
 
 ## Elevator pitch
 
-You write a `Pipeline` (a Python class that does some measurement on a model).
-autoresearch dispatches it onto a GPU pod, persists its findings somewhere
-durable, and lets you check in from your laptop while it runs. Your laptop can
-disconnect; the experiment keeps going.
+You hit a promising result on Qwen-14B. You want to know if it replicates
+on Qwen-32B. Or on the Nanda EM setup. Or under 10 hyperparameter variants.
+
+You type `/transfer` in Claude Code, describe the variation in plain
+English ("do the same FRA measurement on Qwen-32B as we did on -14B"),
+chat with Claude for 5 minutes about hardware + budget + any judgement
+calls only you can make. Then you close your laptop and move on with
+your day.
+
+Server-side:
+
+- A **prep agent** quietly fixes the obvious bits of your code that
+  wouldn't survive an off-laptop dispatch — hardcoded `/root/` paths,
+  mistuned dep pins, the things you'd otherwise notice mid-failure and
+  have to come back to.
+- Your **training runs** on the GPU you agreed on.
+- A **postflight agent** writes the summary — spend, throughput, the
+  result, sanity checks, links to wandb / HF — and commits it to your
+  project repo as `autoresearch/runs/<run_id>/experiment_summary.md` on
+  a `autoresearch/results-<run_id>` branch.
+
+You see the markdown next time you `git pull` on your laptop, or open
+the branch on GitHub from your phone. The headline is the spend total
+and the outcome. If you want details, the body has them. If it looks
+good, you merge or cherry-pick the result into your paper draft. If it
+looks suspicious, you've still only spent the agreed budget — and the
+findings + log snapshots + git diff of any prep edits are all there to
+diagnose from.
+
+The user-disengaged loop is the core promise: "I've got a promising
+result; help me batch-test it across the variations I'd otherwise spend
+a weekend running by hand."
 
 ## The four layers
 
