@@ -1,0 +1,25 @@
+{
+  "name": "autoresearch",
+  "owner": {
+    "name": "Dmitry Manning-Coe",
+    "url": "https://github.com/chainik1125"
+  },
+  "description": "Single-plugin marketplace for autoresearch — install with `/plugin marketplace add chainik1125/autoresearch` then `/plugin install autoresearch@autoresearch`.",
+  "plugins": [
+    {
+      "name": "autoresearch",
+      "source": {
+        "source": "github",
+        "repo": "chainik1125/autoresearch"
+      },
+      "description": "Off-laptop research automation: dispatch GPU pipelines, persist findings, survive pod death.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Dmitry Manning-Coe"
+      },
+      "homepage": "https://github.com/chainik1125/autoresearch",
+      "repository": "https://github.com/chainik1125/autoresearch",
+      "license": "MIT"
+    }
+  ]
+}

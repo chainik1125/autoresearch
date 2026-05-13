@@ -17,16 +17,32 @@ Other workflows (replicate, sweep, multi-model review, night-run) exist as stubs
 
 The "agent" role is small and structured: three bounded LLM calls (preflight check, postflight validation, error summarization). The pipeline runner itself is a deterministic FSM you can read in 60 lines.
 
-## Quickstart (project side, once v1 is built)
+## Quickstart (v0 plugin install)
 
-```bash
-uv add autoresearch
-autoresearch init                       # drops .claude/skills/transfer.md and autoresearch.toml
-# edit autoresearch.toml with your controller URL + S3 bucket
-# write a Pipeline in pipelines/
+`autoresearch` ships as a Claude Code plugin. The plugin gives you `/transfer`
++ `/make_compatible` skills and registers the MCP server pointing at your
+controller — version-locked, no per-project copies, updates flow through
+`/plugin update`.
+
+In Claude Code:
+
+```
+/plugin marketplace add chainik1125/autoresearch
+/plugin install autoresearch@autoresearch
 ```
 
-From Claude Code on your laptop: `/transfer my_pipeline target_model`.
+When prompted, paste your controller URL (e.g.
+`https://my-controller.up.railway.app/mcp/`).
+
+Per-project setup is then just `autoresearch.toml`:
+
+```bash
+uv add autoresearch                     # for the Python package + CLI
+# write autoresearch.toml manually or use `autoresearch init` for a stub
+# write a Pipeline class in pipelines/<name>.py
+```
+
+From Claude Code on your laptop, in any project: `/transfer my_pipeline target_model`.
 
 ## Deploying
 
@@ -41,4 +57,15 @@ Short version:
 
 ## Status
 
-v1 code complete (96 tests passing). v1 verification (task 12) needs the GitHub→GHCR→Railway→RunPod loop wired live. See `notes/ideas.md` for the roadmap beyond v1.
+v1 verified end-to-end: Qwen-32B SAE training dispatched from Claude Code,
+runs to completion, results back via MCP. 128 tests passing.
+
+Plugin v0 (this commit): `/plugin marketplace add chainik1125/autoresearch`
+ships `/transfer` + `/make_compatible` + the MCP server config in one
+install. See `.claude-plugin/plugin.json` for the manifest;
+`.claude-plugin/marketplace.json` for the marketplace stub.
+
+See `notes/ideas.md` for the roadmap and `notes/working_notes.md` for the
+current focus + the detailed failure-modes writeup from the Qwen-32B
+canary loop (the nine root-cause bugs that drove v1 from "feature-
+complete" to "actually-working").

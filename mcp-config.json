@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "autoresearch": {
+      "type": "http",
+      "url": "${user_config.controller_url}"
+    }
+  }
+}

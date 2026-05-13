@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin",
+  "name": "autoresearch",
+  "version": "0.1.0",
+  "description": "Off-laptop research automation: dispatch GPU pipelines from Claude Code, persist results to R2, survive pod death, summarize from your laptop.",
+  "author": {
+    "name": "Dmitry Manning-Coe"
+  },
+  "homepage": "https://github.com/chainik1125/autoresearch",
+  "repository": "https://github.com/chainik1125/autoresearch",
+  "keywords": ["research", "mcp", "runpod", "sae", "interpretability"],
+  "mcpServers": "./mcp-config.json",
+  "userConfig": {
+    "controller_url": {
+      "type": "string",
+      "title": "autoresearch controller URL",
+      "description": "Your project's autoresearch controller endpoint (e.g. https://my-controller.up.railway.app/mcp/). The controller is the always-on FastAPI app that dispatches pods on your behalf. See https://github.com/chainik1125/autoresearch#deploy-the-controller for setup.",
+      "required": true
+    }
+  }
+}
