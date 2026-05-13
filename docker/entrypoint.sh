@@ -22,6 +22,23 @@ fi
 
 # --- pod mode ---
 
+# Start sshd in the background so the pod is shell-accessible for debugging.
+# RunPod's pod-create wiring exposes port 22 + injects the operator's public keys
+# into $PUBLIC_KEY. The base image has /usr/sbin/sshd; we just need to give it
+# host keys + authorized_keys and let it daemonize. This is a no-op if sshd
+# isn't installed (e.g. a future base image change). Cost is ~50ms at boot.
+if [[ -x /usr/sbin/sshd ]]; then
+    mkdir -p /root/.ssh
+    if [[ -n "${PUBLIC_KEY:-}" ]]; then
+        echo "$PUBLIC_KEY" > /root/.ssh/authorized_keys
+        chmod 700 /root/.ssh
+        chmod 600 /root/.ssh/authorized_keys
+    fi
+    ssh-keygen -A 2>/dev/null || true
+    /usr/sbin/sshd
+    echo "[entrypoint] sshd started; debug with: ssh -p <port> root@<ip>"
+fi
+
 WORKSPACE="${WORKSPACE_DIR:-/workspace}"
 mkdir -p "${WORKSPACE}/.huggingface" "${WORKSPACE}/.cache/pip"
 
