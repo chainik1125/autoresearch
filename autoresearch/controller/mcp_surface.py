@@ -261,6 +261,126 @@ def build_mcp(
         return {"ok": True, "status": run.status.value}
 
     @mcp.tool()
+    def start_prepare(
+        pipeline_name: str,
+        target_model: str | None = None,
+        intent: str | None = None,
+        params: dict[str, Any] | None = None,
+        project_repo_url: str | None = None,
+        project_repo_branch: str | None = None,
+        project_repo_token: str | None = None,
+        budget_usd: float | None = None,
+        parent_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a PREPARE Run — pre-flight static review of the project.
+
+        Single-shot LLM call (in v0) that reviews the project's pipeline
+        class + tree for blockers to unattended dispatch (hardcoded paths,
+        missing env vars, dep issues). Defaults to plan-mode: reports
+        findings but doesn't yet apply patches (that's v1).
+
+        Returns `{run_id, status, pod_handle}`. Use `list_findings(run_id)`
+        to read the review when complete. The agent's recommendation lands
+        in the result dict's `blockers_found` field.
+        """
+        if compute is None:
+            raise ValueError("compute backend not configured")
+        final_params: dict[str, Any] = dict(params or {})
+        if target_model is not None:
+            final_params["target_model"] = target_model
+        if intent is not None:
+            final_params["intent"] = intent
+        if project_repo_url is not None:
+            final_params["project_repo_url"] = project_repo_url
+        if project_repo_branch is not None:
+            final_params["project_repo_branch"] = project_repo_branch
+        run = dispatcher.dispatch_new(
+            workflow="prepare",
+            pipeline_name=pipeline_name,
+            params=final_params,
+            budget_usd=budget_usd or settings.default_budget_usd,
+            settings=settings,
+            storage=storage,
+            compute=compute,
+            required_vram_gb=8,   # prep agent doesn't need GPU, but RunPod requires one — pick smallest
+            project_repo_url=project_repo_url,
+            project_repo_token=project_repo_token,
+            project_repo_branch=project_repo_branch,
+            parent_run_id=parent_run_id,
+        )
+        return {"run_id": run.id, "status": run.status.value, "pod_handle": run.pod_handle}
+
+    @mcp.tool()
+    def start_mechanic(
+        target_run_id: str,
+        intent: str | None = None,
+        budget_usd: float | None = None,
+        parent_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a MECHANIC Run — one-shot health check on `target_run_id`.
+
+        Returns `{run_id, status, pod_handle}`. Use `list_findings(run_id)`
+        to read the recommendation when complete. The agent's recommendation
+        (`continue` / `cancel` / `redispatch` / `investigate`) lands in the
+        result dict's `recommendation` field.
+        """
+        if compute is None:
+            raise ValueError("compute backend not configured")
+        params: dict[str, Any] = {"target_run_id": target_run_id}
+        if intent is not None:
+            params["intent"] = intent
+        run = dispatcher.dispatch_new(
+            workflow="mechanic",
+            pipeline_name="mechanic",
+            params=params,
+            budget_usd=budget_usd or settings.default_budget_usd,
+            settings=settings,
+            storage=storage,
+            compute=compute,
+            required_vram_gb=8,
+            parent_run_id=parent_run_id,
+        )
+        return {"run_id": run.id, "status": run.status.value, "pod_handle": run.pod_handle}
+
+    @mcp.tool()
+    def start_postflight(
+        target_run_id: str,
+        project_repo_url: str | None = None,
+        project_repo_branch: str | None = None,
+        project_repo_token: str | None = None,
+        budget_usd: float | None = None,
+        parent_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch a POSTFLIGHT Run — generate + push experiment_summary.md.
+
+        Fires after a transfer Run reaches terminal state. The agent reads
+        the target Run's findings + result, writes a markdown experiment
+        report (spend in headline), and commits + pushes it to the user's
+        project repo on `autoresearch/results-<target_run_id>`. Best-effort
+        — push is skipped if no PROJECT_REPO_TOKEN or no remote.
+
+        Returns `{run_id, status, pod_handle}`.
+        """
+        if compute is None:
+            raise ValueError("compute backend not configured")
+        params: dict[str, Any] = {"target_run_id": target_run_id}
+        run = dispatcher.dispatch_new(
+            workflow="postflight",
+            pipeline_name="postflight",
+            params=params,
+            budget_usd=budget_usd or settings.default_budget_usd,
+            settings=settings,
+            storage=storage,
+            compute=compute,
+            required_vram_gb=8,
+            project_repo_url=project_repo_url,
+            project_repo_token=project_repo_token,
+            project_repo_branch=project_repo_branch,
+            parent_run_id=parent_run_id,
+        )
+        return {"run_id": run.id, "status": run.status.value, "pod_handle": run.pod_handle}
+
+    @mcp.tool()
     def recommend_hardware(
         required_vram_gb: int,
         intent: str | None = None,

@@ -25,6 +25,7 @@ from autoresearch.core.run import Run, RunStatus
 
 
 _ACTIVE_STATUSES = (RunStatus.QUEUED, RunStatus.LOADING, RunStatus.RUNNING, RunStatus.VALIDATING)
+_TERMINAL_STATUSES = (RunStatus.COMPLETED, RunStatus.FAILED)
 _log = logging.getLogger("autoresearch.supervisor")
 
 
@@ -67,13 +68,42 @@ class Supervisor:
                 pass
 
     def tick(self) -> list[str]:
-        """One pass over all active runs. Returns the list of run ids restarted."""
+        """One pass over all runs.
+
+        Two things happen on each tick:
+          1. **Restart**: any active-status Run with a stale heartbeat gets
+             redispatched on the same network volume.
+          2. **Cleanup**: any terminal-status Run (COMPLETED/FAILED) whose
+             pod is still alive gets its pod terminated. This is what
+             solves the "who kills the postflight pod" question — the pod
+             marks its own Run as COMPLETED at the end of its workflow,
+             and the next supervisor tick (≤30s later) terminates it.
+             Applies to *all* workflows (transfer, prepare, mechanic,
+             postflight), so we never leak compute on completed work.
+
+        Returns the list of run ids restarted in this tick (for logging /
+        observability — cleanups are logged but not returned).
+        """
         restarted: list[str] = []
         now = datetime.now(UTC)
         short_stale = timedelta(minutes=self.settings.supervisor_stale_minutes)
         long_stale = timedelta(hours=self.settings.supervisor_long_call_stale_hours)
 
         for run in Run.list_all(self.storage):
+            # --- Cleanup: terminate pods of terminal-status Runs --------
+            if run.status in _TERMINAL_STATUSES and run.pod_handle:
+                try:
+                    handle = self.compute.get_session(run.pod_handle)
+                    if handle.status in ("running", "queued"):
+                        _log.info(
+                            "run %s is %s; terminating still-alive pod %s",
+                            run.id, run.status.value, run.pod_handle,
+                        )
+                        self.compute.terminate_session(run.pod_handle)
+                except Exception:  # noqa: BLE001 -- best-effort; pod may already be gone
+                    pass
+                continue
+
             if run.status not in _ACTIVE_STATUSES:
                 continue
             beat = heartbeat.load(self.storage, run)

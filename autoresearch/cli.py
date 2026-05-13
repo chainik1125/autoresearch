@@ -119,27 +119,46 @@ def cmd_run(args: argparse.Namespace) -> int:
         run.save(storage)
         print(f"created run {run.id}", file=sys.stderr)
 
-    pipeline = _load_pipeline(pipeline_name, settings.pipeline_module_path)
+    # Only transfer needs a Pipeline class. prep/mechanic/postflight are
+    # agent-driven workflows that don't run user pipeline code.
+    pipeline = _load_pipeline(pipeline_name, settings.pipeline_module_path) if workflow == "transfer" else None
 
     # Pod mode mounts the persistent volume at /workspace; local mode uses a per-run dir.
     default_workspace = os.environ.get("WORKSPACE_DIR") or f"./workspace-{run.id}"
     workspace = Path(args.workspace or default_workspace).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
 
+    # Workflow registry. Each workflow knows how to consume the inputs it
+    # needs from the Run + storage + workspace.
     if workflow == "transfer":
         from autoresearch.workflows.transfer import transfer as run_workflow
 
         result = run_workflow(
-            run,
-            pipeline,
-            storage=storage,
-            workspace=workspace,
-            model_client=model_client,
+            run, pipeline,
+            storage=storage, workspace=workspace, model_client=model_client,
             preflight=settings.preflight and model_client is not None,
             postflight=settings.postflight and model_client is not None,
             summarize_errors=settings.summarize_errors and model_client is not None,
             heartbeat=args.heartbeat,
         )
+    elif workflow == "prepare":
+        if model_client is None:
+            print("workflow=prepare requires a model client (set ANTHROPIC_API_KEY)", file=sys.stderr)
+            return 2
+        from autoresearch.workflows.prepare import prepare as run_workflow
+        result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
+    elif workflow == "mechanic":
+        if model_client is None:
+            print("workflow=mechanic requires a model client (set ANTHROPIC_API_KEY)", file=sys.stderr)
+            return 2
+        from autoresearch.workflows.mechanic import mechanic as run_workflow
+        result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
+    elif workflow == "postflight":
+        if model_client is None:
+            print("workflow=postflight requires a model client (set ANTHROPIC_API_KEY)", file=sys.stderr)
+            return 2
+        from autoresearch.workflows.postflight import postflight as run_workflow
+        result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
     else:
         print(f"workflow {workflow!r} not implemented in v1", file=sys.stderr)
         return 2
