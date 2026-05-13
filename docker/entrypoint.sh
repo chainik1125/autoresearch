@@ -98,8 +98,14 @@ echo "[entrypoint] mode=pod  RUN_ID=$RUN_ID  starting runner"
 # `list_findings` MCP tool. Without this, the only way to see those logs is to
 # spin a separate shell pod and SSH the volume — which has cost us a lot of
 # debugging time on this branch.
+#
+# CRITICAL: disable `set -e` for the runner call. The whole point of the
+# snapshot below is to handle a non-zero exit; if `set -e` aborts the script
+# at the first failure we never reach it.
+set +e
 autoresearch run --run-id "$RUN_ID" --heartbeat "$@"
 RUNNER_RC=$?
+set -e
 
 if [[ $RUNNER_RC -ne 0 ]]; then
     echo "[entrypoint] runner exited $RUNNER_RC; snapshotting recent training logs as findings"
