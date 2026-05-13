@@ -17,17 +17,32 @@ completing Phase 0** unless the call is unambiguous (see the skip rule).
 **The full chain you orchestrate:**
 
 ```
-Phase 0  intent discovery (you + user)
+Phase 0  intent discovery (you + user, conversational)
 Phase 1  recommend_hardware (you call MCP, surface to user)
-Phase 2  start_prepare → poll until COMPLETED → read findings → abort on blockers
-Phase 3  readiness check (local file checks)
+Phase 1.5 user-input checklist (PREP_CHECKLIST.md — FAST, ≤90s)
+Phase 2  start_prepare → returns immediately, runs off-laptop
+Phase 3  local readiness check (file existence — NOT code inspection)
 Phase 4  start_transfer with auto_postflight=true → user disengages
+[server] prep pod does deep code inspection / patching on its own branch
 [server] transfer pod runs; supervisor auto-fires start_postflight at terminal state
 [server] postflight pod writes experiment_summary.md, pushes to user's repo, then reaps
 ```
 
-The user disengages after Phase 4. Prep and postflight are real Runs with
-their own findings — readable any time via `list_findings(run_id)`.
+The user disengages after Phase 4. Prep, transfer, postflight are real Runs
+with their own findings — readable any time via `list_findings(run_id)`.
+
+**Critical role division — keep this in mind throughout:**
+
+- **You (local Claude)** decide what to *ask the user*. Auth tokens,
+  scope, budget, ambiguous defaults. Things only the user can answer.
+  Time budget: 30-90s of conversation + checklist scan. **DO NOT
+  exhaustively read project code.**
+- **The prep agent (off-laptop)** does the slow inspection. Hardcoded
+  paths, missing deps, env-var quirks, edits + commits on a fresh
+  branch. Takes 5-10 min but the user has already disengaged.
+
+If you find yourself about to grep through someone's `pipelines/`
+directory: stop. That's prep-agent work.
 
 ---
 
@@ -127,59 +142,83 @@ to relax (DC, VRAM floor, wait for inventory).
 
 ---
 
-## Phase 2 — Prepare (`start_prepare`)
+## Phase 1.5 — User-input checklist (FAST)
 
-Now that you know what you're dispatching and on what hardware, fire the
-prep agent BEFORE the main compute dispatch. Prep is a cheap (~$0.05),
-quick (~5 min) static review on a small pod that catches the predictable
-class of "won't survive an off-laptop dispatch" bugs: hardcoded paths,
-missing env vars, dependency issues.
+Open and scan `PREP_CHECKLIST.md` (lives next to this file in the
+plugin). For each item:
+
+1. Run the **Check** (these are deterministic — file read, env grep,
+   `params` inspect; do them yourself, no MCP needed).
+2. If the check surfaces ambiguity → ask the **Ask** verbatim or
+   close to it.
+3. If the check is fine → no question, move on.
+
+Hard time budget: 30-90 seconds total. The checklist has 10 items in
+v0; most will be no-ops because defaults are right or env vars are
+present.
+
+Things to NOT do here:
+- Don't grep through `pipelines/` for hardcoded paths.
+- Don't read the pipeline class's full source.
+- Don't run `import` smoke tests.
+
+All of that is prep-agent work and would defeat the "user disengages
+fast" goal.
+
+After Phase 1.5, you have:
+- Confirmed auth (HF, GitHub PAT, WandB)
+- Confirmed scope (branch, backend choice, budget)
+- The user's heads-up on heavy first-time downloads
+
+## Phase 2 — Prepare (`start_prepare`) — fire-and-forget
+
+Dispatch the prep agent. **Do NOT wait** for it before dispatching
+transfer — that's the point of having prep run off-laptop. The prep
+agent's findings will land in `list_findings(prep.run_id)`; the user (or
+a continuation agent) can read them later if needed.
 
 ### Call
 
 ```
 prep = start_prepare(
-    pipeline_name      = "...",
-    target_model       = "...",
-    intent             = "<from Phase 0>",
-    project_repo_url   = "...",
+    pipeline_name       = "...",
+    target_model        = "...",
+    intent              = "<from Phase 0>",
+    project_repo_url    = "...",
     project_repo_branch = "...",
-    project_repo_token = "...",     # if private
-    params             = {...},     # the full params dict you'll pass to start_transfer
+    project_repo_token  = "...",    # if private
+    params              = {...},    # same params dict you'll pass to start_transfer
 )
 ```
 
-Returns `{run_id, status, pod_handle}`. Status is `queued`.
+Returns `{run_id, status, pod_handle}`. Note the `run_id` — tell the user
+"prep dispatched as `<id>`; check `list_findings <id>` later if you want
+to see the review." Then immediately proceed to Phase 3.
 
-### Wait for it
+### Why not wait
 
-Poll `get_run(prep.run_id)` every 30s. Status will go `queued → running →
-completed` or `failed`. Typically <10 min. While waiting, tell the user
-what you're doing — don't go silent.
+If the local Claude blocks on prep, the user's "disengage in 5-10min"
+goal is blown. The prep agent's findings are:
 
-### Read the review
+- **Mechanical** (`[MECHANICAL]` prefix in its output) — it will fix
+  these itself in v1 (today: report-only). The user doesn't need to
+  intervene.
+- **User-input-needed** (`[USER-INPUT-NEEDED]` prefix) — these would
+  have been caught by the Phase 1.5 checklist if they were
+  predictable. Anything novel that surfaces here means the checklist
+  needs to grow; in the meantime, the prep agent halts and writes a
+  finding. The user notices on their next check-in and decides.
 
-```
-findings = list_findings(prep.run_id)
-```
+The prep agent runs in parallel with the transfer dispatch in v0. If
+prep surfaces a fatal issue after transfer starts, the user can cancel
+the transfer Run when they notice. (v1 trajectory: have transfer wait
+on prep's all-clear before starting the actual training, so the
+race is closed without blocking the laptop.)
 
-Look for the `prepare` OBSERVATION finding. Either:
+## Phase 3 — Local readiness check (FAST file existence)
 
-- **`OK: looks fine, dispatch as-is`** → proceed to Phase 3.
-- **Bullets with blockers** → tell the user what was flagged, in plain
-  language. If the blockers are mechanical (e.g. hardcoded /root/ path
-  the prep agent proposed to symlink, missing env var), confirm with the
-  user that those are OK to live with, then proceed. If they're
-  substantive (e.g. dataset doesn't exist, code won't run on the target
-  model), tell the user to fix or abort.
-
-Prep agent runs in plan-mode in v0 — it reports blockers but doesn't
-apply patches. v1 will add a confirm-and-apply path.
-
-## Phase 3 — Readiness check (local)
-
-Verify locally that everything is in place to dispatch. Stop at the first
-failing check.
+Verify locally that everything is in place to dispatch. **File-existence
+checks only — no code inspection.** Stop at the first failing check.
 
 ### 3a. Project structure
 
