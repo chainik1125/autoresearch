@@ -33,7 +33,14 @@ from autoresearch.backends.storage import StorageBackend
 @runtime_checkable
 class Pipeline(Protocol):
     name: str
+    # `required_gpu` is a human-readable hint, kept for backwards compat.
+    # `required_vram_gb` is what the hardware-selection module (see
+    # `core/hardware.py`) actually uses to filter offers. If only one is set,
+    # the dispatcher uses whichever it can: `required_vram_gb` first, falling
+    # back to a lookup table on `required_gpu`. New pipelines should set
+    # `required_vram_gb` so the auto-selector has hard numbers to filter on.
     required_gpu: str
+    required_vram_gb: int
     estimated_minutes: int
 
     def run(

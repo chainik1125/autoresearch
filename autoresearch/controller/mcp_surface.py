@@ -47,7 +47,9 @@ def build_mcp(
         pipeline_name: str,
         target_model: str | None = None,
         source_model: str | None = None,
-        gpu: str | None = None,
+        gpu: str | list[str] | None = None,
+        required_vram_gb: int | None = None,
+        intent: str | None = None,
         budget_usd: float | None = None,
         params: dict[str, Any] | None = None,
         project_repo_url: str | None = None,
@@ -77,7 +79,22 @@ def build_mcp(
         never persisted to storage or logs.
 
         `project_repo_branch` overrides the default branch so the pod clones a
-        specific branch (e.g. one made by make_compatible.md)."""
+        specific branch (e.g. one made by make_compatible.md).
+
+        Hardware selection:
+          - `gpu` can be a single GPU type name (e.g. "L40S") OR a list in
+            preference order (e.g. ["L40S","L40","A6000","A40"]). Bypasses
+            auto-selection.
+          - `required_vram_gb`: when `gpu` is not given, the dispatcher
+            queries the backend catalog and runs
+            `core/hardware.py:recommend()` to pick. Combined with `intent`
+            this uses the LLM advisor; without `intent` it falls back to
+            the deterministic fastest-least-complicated heuristic.
+          - `intent`: short free-form text describing what the run is for
+            ("quick canary", "200M-token sweep, prefer cost"). Lets the
+            advisor trade off speed vs cost. Prefer to call
+            `recommend_hardware` first to surface confidence + ask the
+            user if confidence is "needs_review"."""
         if compute is None:
             raise ValueError("compute backend not configured (set compute=runpod in autoresearch.toml)")
 
@@ -105,6 +122,9 @@ def build_mcp(
             storage=storage,
             compute=compute,
             gpu=gpu,
+            required_vram_gb=required_vram_gb,
+            model_client=model_client,
+            intent=intent,
             project_repo_url=project_repo_url,
             project_repo_token=project_repo_token,
             project_repo_branch=project_repo_branch,
@@ -237,6 +257,61 @@ def build_mcp(
         run.last_error = run.last_error or "cancelled by operator"
         run.save(storage)
         return {"ok": True, "status": run.status.value}
+
+    @mcp.tool()
+    def recommend_hardware(
+        required_vram_gb: int,
+        intent: str | None = None,
+        pipeline_name: str = "<unspecified>",
+        estimated_minutes: int = 0,
+    ) -> dict[str, Any]:
+        """Return a HardwareRecommendation for a hypothetical dispatch.
+
+        The /transfer skill calls this in Phase 0 before `start_transfer` so
+        it can:
+          - Show the user the rationale upfront ("I picked H100 because…").
+          - Branch on `confidence`: "high" → just dispatch and narrate;
+            "needs_review" → ask the user via conversation, surfacing the
+            `alternatives` so they have a choice.
+
+        Returns: `{picks, confidence, rationale, alternatives}`. Picks is
+        the gpuTypeId list (preference order) you'd pass to `start_transfer`
+        as `gpu=...`. Confidence is "high" or "needs_review".
+
+        See `core/hardware.py:recommend()` for the underlying logic.
+        """
+        if compute is None:
+            return {
+                "picks": [],
+                "confidence": "needs_review",
+                "rationale": "compute backend not configured; cannot query GPU catalog",
+                "alternatives": [],
+            }
+        try:
+            offers = compute.list_gpu_offers(settings.runpod_data_center)
+        except Exception as exc:  # noqa: BLE001 -- surface error to caller
+            return {
+                "picks": [],
+                "confidence": "needs_review",
+                "rationale": f"failed to query GPU catalog: {exc!s}",
+                "alternatives": [],
+            }
+        from autoresearch.core.hardware import recommend as _recommend
+        rec = _recommend(
+            offers,
+            required_vram_gb=required_vram_gb,
+            data_center_id=settings.runpod_data_center,
+            intent=intent,
+            pipeline_name=pipeline_name,
+            estimated_minutes=estimated_minutes,
+            client=model_client,
+        )
+        return {
+            "picks": rec.picks,
+            "confidence": rec.confidence,
+            "rationale": rec.rationale,
+            "alternatives": rec.alternatives,
+        }
 
     @mcp.tool()
     def list_pipelines() -> list[str]:

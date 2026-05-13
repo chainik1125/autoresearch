@@ -20,7 +20,10 @@ from pydantic import BaseModel, Field
 
 
 class SessionSpec(BaseModel):
-    gpu: str                                   # e.g. "H100 80GB" or a RunPod GPU type id
+    # Either a single GPU type ("H100 80GB") OR a list of acceptable types in
+    # preference order. The backend picks the first one with current inventory.
+    # See `core/hardware.py` for the selection logic that produces the list.
+    gpu: str | list[str]
     image: str                                 # Docker image
     network_volume_id: str                     # required: where the HF cache & user pipelines live
     env: dict[str, str] = Field(default_factory=dict)  # injected into the pod
@@ -52,3 +55,16 @@ class ComputeBackend(Protocol):
     def create_session(self, spec: SessionSpec) -> SessionHandle: ...
     def get_session(self, session_id: str) -> SessionHandle: ...
     def terminate_session(self, session_id: str) -> None: ...
+
+    def list_gpu_offers(self, data_center_id: str | None = None) -> "list":
+        """Return a list of `GpuOffer` for the backend's current catalog.
+
+        Returns `core.hardware.GpuOffer` objects. If `data_center_id` is set,
+        each offer's `available_in_dc` reflects stock specifically in that
+        DC; otherwise `available_in_dc` mirrors global availability.
+
+        Backends that don't have a pricing/inventory API can return an empty
+        list — the dispatcher will fall back to the user's explicit `gpu`
+        argument or `settings.default_gpu`.
+        """
+        ...

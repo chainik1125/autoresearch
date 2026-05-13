@@ -109,6 +109,159 @@ if not, invoke `make_compatible.md`.
   confirmation), or always require the user to push themselves? Lean
   automatic-after-confirmation — fewer steps, still gated.
 
+## Failure modes from the Qwen-32B SAE canary loop (2026-05-13)
+
+Working through `sae_training` on Qwen-32B end-to-end exposed nine separate
+failure modes plus two missing debugging affordances. Each one masked the next,
+so the loop was: dispatch, fail silently, fix one thing, redispatch, hit the
+next. Total: 13 canaries before canary 13 completed cleanly. Writing this up
+because future pipelines will hit subsets of these.
+
+### The bugs (in the order they surfaced)
+
+1. **`pandas==3.0.2` clashes with `transformer-lens` on Python 3.11.** The
+   project's `requirements.txt` was produced by `uv pip freeze` on a Mac, where
+   nothing exercised transformer-lens's version constraint. On the pod's Linux
+   Python 3.11, transformer-lens 2.18 requires `pandas<2.1` and pip's resolver
+   gave up. Fix: relax pin to `pandas<2.1`. **Lesson:** a Mac-side
+   `uv pip freeze` is not a portable manifest — transitive deps can pin to
+   conflicting upper bounds the host venv doesn't trigger.
+
+2. **`torch==2.11.0` upgraded without matching `torchvision` / `torchaudio`.**
+   The runpod/pytorch base image ships torchvision 0.19.1 pinned to torch 2.4.1.
+   `pip install -r requirements.txt` upgraded torch to 2.11 but left
+   torchvision alone, producing an ABI mismatch (`operator torchvision::nms
+   does not exist`) that crashed `import sae_lens` at startup. Fix: add
+   `torchvision` and `torchaudio` (unpinned) so pip picks compatible versions.
+   **Lesson:** if the project pins torch above the base image's version,
+   torchvision and torchaudio must move in lockstep — they can't be left to
+   the base image.
+
+3. **`LoggingConfig(wandb_run_name=...)` wrong kwarg.** sae-lens 6.39 renamed
+   it to `run_name`. The script hit a clean TypeError at config build. Fix:
+   rename kwarg. **Lesson:** sae-lens release notes are sparse on rename
+   commits; verify config kwargs against the installed version, not docs.
+
+4. **`WORKSPACE_DIR` not injected into pod env.** `cli.py` reads
+   `os.environ.get("WORKSPACE_DIR")` and falls back to `./workspace-<run_id>`
+   relative to cwd. cwd inside the container was `/app`, so workspace landed on
+   the ephemeral container disk and every artifact (`training.log` included)
+   died with the pod. Fix: `secrets.env_for_run` now emits
+   `WORKSPACE_DIR=/workspace`. **Lesson:** anything the runner reads from env
+   has to be explicitly injected — relying on cwd for default-workspace
+   resolution is brittle.
+
+5. **RunPod auto-restarted exited containers, producing fast loops.** Once the
+   pod's `autoresearch run` exited non-zero, RunPod's default container behavior
+   restarted it every ~15 seconds. The runner loaded the same Run, re-entered
+   the failed phase, wrote another identical error finding, exited, restarted.
+   Burned $1.75 in 35 minutes invisibly. Fix: `cli.py` checks
+   `run.status in (FAILED, COMPLETED)` at the top and exits 0, so RunPod
+   doesn't see a crash to recover from. **Lesson:** clean exit on terminal
+   state — non-zero exit is reserved for "something the supervisor should
+   actually retry."
+
+6. **Marker-gated pip install left fresh containers without deps.** The
+   entrypoint cached "pip install ran on this volume" in
+   `/workspace/.cache/requirements-installed.marker`. But the marker lives on
+   the persistent volume while `/usr/local/lib/python3.11/site-packages` is
+   ephemeral. New pod with a marker from a previous pod → skip install → no
+   sae_lens → ModuleNotFoundError at module import. Fix: drop the marker,
+   always pip install. The on-volume pip cache keeps re-installs to ~30-60s
+   when wheels are cached. **Lesson:** install caches and dep markers must
+   live on the *same* lifecycle layer. Pip cache on the volume is OK because
+   pip looks for it; install marker on the volume is NOT OK because Python
+   doesn't.
+
+7. **sae-lens needs `zstandard` for `monology/pile-uncopyrighted`.** The
+   pile-uncopyrighted shards are zstd-compressed JSONL; fsspec's compression
+   detection needs the `zstandard` package installed or it crashes with
+   `ValueError: Compression type zstd not supported`. Fix: add `zstandard` to
+   requirements. **Lesson:** streaming HF datasets sometimes have implicit
+   compression-codec deps that aren't transitively pulled by `datasets`.
+
+8. **Qwen-32B + SAE Adam state exceeds 80GB.** On H100 80GB, training fits the
+   model (~64GB bf16) and forward activations comfortably, then OOMs on the
+   *first backward* — the SAE optimizer state (Adam moments for
+   d_in=5120 × d_sae=102400 ≈ 1B params × 4 stats × 4 bytes = 16GB) plus
+   gradients pushes total over 80GB. Fix: dispatch on B200 (180GB) at ~2× the
+   hourly rate. **Lesson:** "model fits on H100 80GB" is necessary but not
+   sufficient; downstream training state can double the working set.
+
+9. **`n_checkpoints=10` × 12GB each filled the 200GB volume.** sae-lens dumps
+   the SAE plus activation-buffer state on each checkpoint. For Qwen-32B
+   activations, each dump was ~12GB. The default `n_checkpoints=10` produces
+   120GB of intermediate state per run; two failed runs in a row exhausted the
+   200GB volume and crashed canary 12 mid-final-save with `EDQUOT`. Fix:
+   default `n_checkpoints=1` for canary-style smoke runs (only the final
+   weights); also resized the volume to 500GB for headroom. **Lesson:**
+   sae-lens's default checkpoint cadence is tuned for academic use where you
+   want to resume; canary smoke tests should override it.
+
+### Debugging affordances added in response
+
+10. **Training-log snapshot on runner failure.** When `autoresearch run` exits
+    non-zero, the entrypoint walks `/workspace` for `training.log` files
+    modified in the last hour and uploads the tail (12KB cap) to R2 as an
+    ERROR finding. This is what surfaced bug #6 above — without it, we needed
+    a shell pod (and RunPod inventory) every time to read the actual error.
+    `docker/entrypoint.sh`. **CRITICAL gotcha caught during deployment:** the
+    `set -euo pipefail` at the top of the script killed the entrypoint *before*
+    reaching the snapshot block when the runner exited non-zero. Fixed by
+    wrapping the runner invocation in `set +e` / `set -e`. Always verify that
+    your error-handling code path actually executes on the error path.
+
+11. **`sshd` started in pod-mode entrypoint.** Our custom ENTRYPOINT replaced
+    the base image's sshd-starting init, so `ssh -p <port> root@<ip>` was
+    connection-refused on every canary even though RunPod exposes port 22 and
+    injects `$PUBLIC_KEY`. Now the entrypoint runs `ssh-keygen -A` + drops
+    `$PUBLIC_KEY` into authorized_keys + spawns sshd in the background before
+    starting the runner. Cost: ~50ms at boot, no functional change for
+    success path. **Lesson:** if you override a base image's ENTRYPOINT, you
+    inherit responsibility for whatever the base entrypoint did.
+
+### Operational notes from the loop
+
+- **RunPod inventory in US-CA-2 is volatile.** H100 / H200 / A100-80GB all
+  went dry at least once during this session. B200 was the only >80GB option
+  for hours. Bound-to-DC network volumes magnify this — can't fall back to
+  another DC.
+- **Stuck pods block all dispatches.** When canary 10's runner exited 0
+  cleanly (via the bug #5 fix), the pod stayed in RunPod's `RUNNING` state
+  holding the volume attachment. Subsequent `start_transfer` calls returned
+  500 from RunPod with no error context. Followup TODO: dispatcher should
+  auto-terminate pods when their run reaches a terminal status.
+- **`railway redeploy` reuses the cached source snapshot.** It doesn't always
+  re-pull from main. `railway up` from local source is more reliable when
+  fixing-then-deploying in a tight loop.
+- **`runpod_default_image = :latest`** also surprised us. RunPod caches the
+  `:latest` digest on the host between pod creations, so even after a fresh
+  image push, new pods reuse the cached older digest. Fix: pin
+  `runpod_default_image` to a SHA-tagged image (`sha-<short>`) via the
+  Railway env override `AUTORESEARCH_RUNPOD_DEFAULT_IMAGE`. Forces RunPod to
+  pull the new digest.
+- **Always-install adds ~30-60s per pod boot** (with cache hits) compared to
+  marker-gated. Worth the correctness gain.
+
+### Cost notes — Qwen-32B SAE training, post-mortem
+
+Wandb timestamps for canary 13 show pure training (post norm-scaling)
+throughput is **~1,820 tokens/sec on B200** for d_sae=102400, k=64. The naive
+`elapsed_seconds / training_tokens` rate (406 tok/s reported in the result
+dict) mixes one-time setup with training; for short canaries it underestimates
+steady-state by ~4.5×.
+
+Real extrapolation for a 200M-token full Nura-budget run:
+- Pure training: ~30.5 hours
+- Setup overhead (model load + ActivationsStore init + norm scaling): ~16 min
+- B200 @ $5.98/hr → **~$184 per hookpoint**
+- Multi-layer sweep (e.g. 14 hookpoints) → ~$2.6k
+
+The pipeline's `estimated_200M_token_run_cost_usd` field is misleading because
+(a) it uses the H100 default rate, not the actual GPU, and (b) it
+divides-elapsed-by-tokens. TODO: either pass actual `cost_per_hour` from
+settings or compute throughput from the post-norm-scaling phase only.
+
 ## Notes from the fra_proj exploration
 
 For the bridge skill design, useful concrete observations from

@@ -268,10 +268,18 @@ End-to-end trace, by file and function:
     with the env vars from step [3].
 
 [5] CONTAINER ENTRYPOINT  (docker/entrypoint.sh, MODE=pod)
+    • start sshd in background (debug-access affordance; uses $PUBLIC_KEY)
     • ensure /workspace/.huggingface
     • if PROJECT_REPO_URL set and pipelines/ not on volume → git clone
-    • if pipelines/../requirements.txt → pip install (marker-gated, once per volume)
-    • exec autoresearch run --run-id $RUN_ID --heartbeat
+      (uses PROJECT_REPO_BRANCH if set; basic-auth via PROJECT_REPO_TOKEN
+       for private repos, redacted from logs)
+    • if pipelines/../requirements.txt → pip install ALWAYS (not marker-gated;
+      the on-volume pip cache at /workspace/.cache/pip makes warm installs
+      ~30-60s with cache hits)
+    • run (NOT exec) autoresearch run --run-id $RUN_ID --heartbeat
+    • on non-zero exit: walk /workspace for training.log files modified in
+      the last hour, append the tail (12KB cap) to R2 as an ERROR finding
+      (see "Debug-on-failure affordances" below)
 
 [6] POD-SIDE RUNNER  (autoresearch/cli.py:cmd_run → workflows/transfer.py)
     transfer(run, pipeline, storage, workspace, heartbeat=True):
@@ -409,43 +417,220 @@ The interface Layer 1 sees. Adding a new tool means: write the closure in
 `build_mcp()`, add a test in `tests/test_mcp_surface.py`. Tools are the
 primary place to add operator features (e.g. `compare_runs`, `export_findings`).
 
+## Hardware selection module
+
+`autoresearch/core/hardware.py` — picks which GPU type(s) to ask the compute
+backend for on each dispatch. **This is one of the iteration-targets.** The
+module is intentionally small and self-contained so heuristics, prompts, and
+selection strategies can evolve without touching the dispatcher.
+
+### Why a module at all
+
+Early dispatches hardcoded a single GPU type ("H100 80GB"). When inventory
+went dry in the volume's DC, the create-pod API 500'd and we had to manually
+re-issue with a different GPU type. RunPod's `gpuTypeIds` accepts a list and
+picks any available — letting us pass a preference-ordered fallback ladder.
+But what goes on that ladder is non-trivial: it depends on the pipeline's
+working-set memory, the volume's DC inventory, the user's intent (canary vs
+production), and which model the pipeline is loading.
+
+So we split the concern out:
+
+```
+core/hardware.py
+├── GpuOffer                                    # data class: id, mem_gb, $, in_stock
+├── select_gpu_offers(...)                      # pure-Python deterministic ranker
+└── advise_gpu_offers(..., intent, client)      # LLM-advised wrapper, falls back
+                                                #   to select_gpu_offers on failure
+```
+
+And one new method on the compute backend:
+
+```
+ComputeBackend.list_gpu_offers(data_center_id) -> list[GpuOffer]
+```
+
+### Selection flow
+
+```
+dispatcher.dispatch_new(..., gpu=None, required_vram_gb=N, intent="..."):
+  1. If `gpu` is explicit (str or list)  → use as-is, bypass module.
+  2. Else if `required_vram_gb` is set   → compute.list_gpu_offers()
+                                          → hardware.recommend(...)
+                                          → return rec.picks
+  3. Else                                 → fall back to settings.default_gpu.
+```
+
+Step 2 is the path `/transfer` takes. The skill calls the
+`recommend_hardware` MCP tool first to surface the choice + confidence to
+the user, then calls `start_transfer` with either the auto-picks (high
+confidence) or the user-confirmed override (needs_review).
+
+### Three layers, three iteration targets
+
+**Layer 1 — deterministic `select_gpu_offers`.** Pure function: filters and
+sorts offers by a named heuristic. Heuristics:
+
+- `"fastest_least_complicated"` (default): smallest VRAM bucket that has
+  1.2× headroom over the floor; within bucket, newest-gen first (price as
+  proxy for generation). Picks L40S for a 30GB job over a 180GB B200 you'd
+  be overpaying for, but picks B200 over an H100 80GB that's borderline
+  for Qwen-32B SAE training (no headroom).
+- `"cheapest"`: lowest price-per-hour first. Used for budget-sensitive
+  sweeps where wall-clock matters less than total cost.
+- `"biggest_memory_first"`, `"fastest_first"`: niche; mostly future-facing
+  knobs once we have observed tokens-per-sec data on real pipelines.
+
+Used by the supervisor's restart path (no LLM in the loop) and as fallback
+when the LLM advisor is unavailable. Unit-tested in
+`tests/test_hardware.py`.
+
+**Layer 2 — `recommend()` with deterministic confidence.** Top-level
+function that wraps layer 1 and produces a `HardwareRecommendation`
+dataclass: `{picks, confidence, rationale, alternatives}`.
+Confidence rule (deterministic path):
+
+- `"high"` — top pick has 1.2× VRAM headroom AND is < $3/hr AND there are
+  ≥2 picks (RunPod has fallback inventory).
+- `"needs_review"` — otherwise. Rationale explains why ("steep rate",
+  "thin inventory", "VRAM at the floor — no headroom").
+
+The /transfer skill consumes the confidence signal: `high` → auto-dispatch
+and narrate; `needs_review` → ask the user via Phase 0 conversation with
+the rationale as framing and `alternatives` as choices.
+
+**Layer 3 — LLM-advised `recommend()`.** Same function, but when called
+with `client` (a `ModelClient`) and `intent` (free-form user text), it
+queries the LLM with `_ADVISOR_PROMPT`. The prompt asks the model to:
+
+1. Apply the fastest-least-complicated default.
+2. Reason about the operator's intent (e.g. "quick canary" → favor speed
+   + battle-tested cards; "exploratory sweep, 10 hookpoints" → favor cost).
+3. Output structured JSON with picks + its own confidence rating.
+
+The model's picks are validated against the actual offers list before
+returning (hallucinated GPU names are dropped). Any failure — invalid
+JSON, no valid picks, network error — falls back silently to layer 2
+(deterministic). Dispatches never block on advisor failure.
+
+The prompt lives in `_ADVISOR_PROMPT` at module scope — single grep target
+to iterate on.
+
+### MCP surface
+
+Two tools cover the hardware-selection UX:
+
+- `recommend_hardware(required_vram_gb, intent?, pipeline_name?, ...)` —
+  returns the recommendation dict so a skill can branch on confidence
+  before dispatching. The /transfer skill calls this in Phase 0.
+- `start_transfer(..., required_vram_gb?, intent?, gpu?)` — accepts both
+  the auto-selection params and a manual override. Forward-compatible
+  with the skill's recommend-then-dispatch flow.
+
+### What to iterate on
+
+The user has flagged this module for active development. Likely changes:
+
+- **Better heuristics**: a `"best_perf_per_dollar"` once we have observed
+  tokens/sec per (gpu, pipeline) stored somewhere — measure once, reuse.
+- **Spot-pod fallthrough**: pass `interruptible=true` to the backend when
+  the user signals tolerance for preemption.
+- **Cross-DC search**: today we filter to the volume's DC. Pipelines that
+  don't need volume reuse could open the search globally.
+- **Prompt richness**: feed historical run data ("this pipeline averaged
+  N hours on H100 last week") into the advisor for calibrated answers.
+- **Streaming inventory probes**: today `list_gpu_offers` is one snapshot.
+  An advisor that re-queries mid-decision could avoid picking something
+  that goes dry in the next 30s.
+- **A "VRAM headroom" knob**: today required_vram_gb is a hard floor; a
+  preference for "1.5× headroom" would prevent edge OOMs without locking
+  in a specific GPU.
+
+The hardware module is *not* the place to put RunPod-specific quirks. Those
+go in `backends/compute/runpod.py:list_gpu_offers`. The hardware module
+just consumes the abstract `GpuOffer` stream.
+
+## Debug-on-failure affordances
+
+Round of canary debugging on Qwen-32B SAE training exposed that "the runner
+exited 1; see /workspace/.../training.log" is useless if you can't read the
+volume. Two affordances ship now (`docker/entrypoint.sh`):
+
+1. **Training-log snapshot to R2.** After `autoresearch run` exits non-zero,
+   walk `/workspace` for `training.log` files modified in the last hour;
+   upload the tail (12KB cap) as an ERROR finding using the existing R2
+   creds in the pod env. `list_findings(run_id)` then includes the actual
+   pipeline subprocess traceback — no shell pod, no SSH. Gotcha: `set -euo
+   pipefail` at the top of the script killed the entrypoint on non-zero
+   exit before reaching the snapshot block; wrap the runner call in
+   `set +e` / `set -e`.
+2. **sshd in pod-mode.** Our custom ENTRYPOINT replaced the base
+   image's sshd init. Now pod-mode runs `ssh-keygen -A`, writes
+   `$PUBLIC_KEY` to `authorized_keys`, starts `/usr/sbin/sshd` in the
+   background, then continues to the runner. ~50ms cost, makes every pod
+   shell-accessible — useful for hangs (where the snapshot affordance
+   can't help because the runner never returned).
+
+## RunPod image-pin gotcha
+
+`runpod_default_image = ".../autoresearch:latest"` is ergonomic but RunPod
+caches the `:latest` digest on hosts between pod creations, so new pods can
+reuse a stale digest after fresh image pushes. Pin to a SHA-tagged image via
+the Railway env override `AUTORESEARCH_RUNPOD_DEFAULT_IMAGE=...:sha-<short>`
+to force a fresh pull. Operational loop:
+1. Push code to main → GHA builds `sha-<short>` + `:latest`
+2. `railway variables --set AUTORESEARCH_RUNPOD_DEFAULT_IMAGE=...:sha-<short>`
+3. Railway rebuilds (Dockerfile builder, ~5min) → new dispatches use new image
+
+## Cost model
+
+The pipeline result's `estimated_200M_token_run_cost_usd` mixes setup overhead
+into the rate and uses an H100 default — both wrong if you have to run on
+B200 (Qwen-32B's SAE training needs >80GB). Use wandb's `_runtime` between
+first and last logged step for steady-state tok/s, then multiply by the
+actual GPU's hourly rate.
+
+Empirical (canary 13, Qwen-32B, layer 16, d_sae=102400, k=64, B200):
+- Steady-state: 1,820 tok/s
+- Setup overhead: ~16 min fixed
+- Full 200M-token run: ~30.5h × $5.98/hr ≈ **$184/hookpoint**
+
 ## What we'd do differently
 
-- **Pipeline discovery is fragile.** Today the runner walks `pipeline_module_path`
-  and looks for classes with a `name` attribute. A proper plugin registry
-  (`entry_points` in pyproject) would be cleaner.
-- **`autoresearch.toml` baked into the controller image is a project-local
-  hack.** For a multi-project controller, env-var-only config is the right model.
-- **No Postgres / SQLite.** Fine at v1 scale, but listing runs requires scanning
-  R2 prefixes (one S3 list per call). A small SQLite-backed index would make
-  `list_runs` instant.
-- **Logging.** Each FSM transition writes a finding, but there's no central
-  "log everything the pipeline printed" mechanism. Pipeline authors who want
-  stdout captured have to write it themselves.
-- **`Pipeline.run()` signature.** `params` is a free-form dict, which means
-  every pipeline has to validate its own inputs. A Pydantic-typed `params`
-  generic would catch mistakes earlier.
+- **Pipeline discovery is fragile.** Walk + `name` attribute lookup; an
+  entry-points plugin registry would be cleaner.
+- **`autoresearch.toml` baked into the controller image** is a project-local
+  hack. Env-var-only config is the right model for a multi-project controller.
+- **No SQLite index.** `list_runs` scans R2 prefixes. Fine at v1 scale.
+- **No central pod-stdout-to-R2 streamer.** The training-log snapshot covers
+  the failure case but only for files named `training.log`.
+- **`Pipeline.run()` `params` is untyped.** Pydantic-typed `params` generic
+  would catch input errors earlier.
+- **Pod lifecycle on terminal runs.** When `cli.py` exits 0 on FAILED to
+  defeat RunPod's container-restart, the pod stays in `RUNNING` state holding
+  the volume. New dispatches return 500. Dispatcher should auto-terminate
+  pods of terminal-status runs.
+- **`cost_per_hour` should come from the dispatched GPU type**, not the
+  hardcoded H100 default in the pipeline result.
 
-These are the targets for the next iteration once the FRA pipeline is real.
+## Real-world example: Qwen-32B SAE training
 
-## What's next: real FRA on Qwen-32B
+First pipeline taken end-to-end was `sae_training` in `fra_proj`
+(`autoresearch/transfer-qwen32b-sae` branch). It wraps an existing argparse
+script (`fra/train_sae_at_hookpoint.py`, built on sae-lens 6.39) by
+subprocess-spawning it with `--output-dir` pointing into `workspace/saes/…`.
+The script writes its own training.log there; the pipeline returns a small
+result dict with throughput, cost extrapolation, wandb URLs, and (when
+enabled) HF Hub URL.
 
-The smoke pipeline (`pipelines/fra_example.py`) sleeps half a second and
-returns fake numbers. The real test is to replace it with the actual FRA
-measurement code from your fra_proj.
+Wrap-don't-restructure was the right call: zero changes to the existing
+CLI's argparse surface; all adapter logic lives in the user's repo's
+`pipelines/sae_training.py`. The autoresearch image only needs to know how
+to clone-and-pip-install.
 
-Concretely, that means:
-1. **Move** the FRA measurement into a `pipelines/fra_measurement.py` (in the
-   fra_proj repo, not this one), conforming to the `Pipeline` protocol.
-2. Set `project_repo_url` in `autoresearch.toml` to point at fra_proj instead
-   of this repo.
-3. If FRA needs special deps (e.g. specific transformers version), add a
-   `requirements.txt` next to `pipelines/` so the entrypoint installs it once
-   per volume.
-4. `/transfer fra_measurement Qwen/Qwen2.5-32B --source Qwen/Qwen2.5-14B`
-   from Claude Code.
-5. First run will be slow — the pod has to download Qwen-32B (~60GB) from HF
-   into the volume. Subsequent runs on the same volume are warm.
-
-After that works once, the extension story is clear and we can talk about the
-real abstractions to bake in (sweep over models, parallel agents, etc.).
+The first canary surfaced nine independent bugs (pandas pin, torchvision
+ABI, sae-lens kwarg rename, missing `WORKSPACE_DIR` injection, RunPod
+restart loop, marker-skip-pip-install, missing zstandard, OOM on H100,
+n_checkpoints disk blowup) before canary 13 completed cleanly. See
+`notes/working_notes.md` → "Failure modes from the Qwen-32B SAE canary
+loop" for the writeup of each.
