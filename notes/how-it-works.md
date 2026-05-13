@@ -239,15 +239,25 @@ redownload everything.
 
 ## Lifecycle of one `/transfer`
 
-End-to-end trace, by file and function:
+End-to-end trace, by file and function. (Reflects the agent chain — see
+"Agent chain" section above for the conceptual picture.)
 
 ```
 [1] You, in Claude Code
-    > /transfer fra_measurement Qwen/Qwen2.5-32B --budget 30
+    > /autoresearch:transfer  (full input — see skills/transfer/SKILL.md)
 
 [2] Claude (the model in Claude Code)
-    Picks the `start_transfer` MCP tool
-      ↓ POST https://<controller>/mcp/  (JSON-RPC)
+    Phase 0: intent discovery
+    Phase 1: recommend_hardware(...)             [MCP call]
+    Phase 1.5: walk skills/transfer/PREP_CHECKLIST.md
+    Phase 2: start_prepare(...)                  [MCP — returns prep.run_id]
+    Phase 3: local file-existence checks (NO code grep)
+    Phase 4: start_transfer(
+               ...,
+               params={..., auto_postflight=True, wait_for_prep_run_id=prep.run_id}
+             )                                   [MCP]
+
+    Tells you "dispatched; chain is server-side from here." You disengage.
 
 [3] CONTROLLER (Railway, autoresearch/controller/server.py)
     mcp_surface.start_transfer(pipeline_name, target_model, budget_usd):
@@ -300,8 +310,21 @@ End-to-end trace, by file and function:
     • heartbeat.json   single-writer, every 30s
 
 [8] POD EXITS
-    autoresearch run returns; container exits; RunPod marks pod EXITED.
-    The volume remains attached to nothing, ready for the next dispatch.
+    autoresearch run returns; container exits.
+    *Supervisor (next tick within ≤30s) sees a terminal-status Run with a
+    still-RUNNING pod and calls compute.terminate_session(). All workflows
+    (prep, transfer, postflight) reap uniformly — see controller/supervisor.py.
+
+[8b] AUTO-POSTFLIGHT (only for transfer Runs)
+    Same supervisor tick that reaps the transfer pod ALSO checks:
+      run.workflow == "transfer" AND run.status terminal
+      AND params.auto_postflight AND not params.postflight_run_id
+    → dispatcher.dispatch_new(workflow="postflight", parent_run_id=run.id, ...)
+      writes the new pf.run_id into params.postflight_run_id (sentinel).
+    Postflight pod boots, reads target Run via .autoresearch_postflight_context.md,
+    headless Claude Code writes experiment_summary.md, runs `git checkout/add/
+    commit/push` to autoresearch/results-<transfer.run_id>. Same supervisor
+    cleans up the postflight pod when it's done.
 
 [9] LAYER 1 INSPECTION (any time, doesn't require pod to be alive)
     Claude Code → MCP tools:
@@ -416,6 +439,125 @@ this and use the Claude Agent SDK directly.
 The interface Layer 1 sees. Adding a new tool means: write the closure in
 `build_mcp()`, add a test in `tests/test_mcp_surface.py`. Tools are the
 primary place to add operator features (e.g. `compare_runs`, `export_findings`).
+
+## Agent chain (prep → transfer → postflight)
+
+A `/transfer` dispatch is no longer a single pod. It's a three-stage pipeline
+of pods, each running a different workflow. The user disengages after the
+initial dispatch; the chain self-orchestrates server-side.
+
+```
+[Local Claude / laptop]
+  /autoresearch:transfer  Phase 0:    intent discovery (conversational)
+                          Phase 1:    recommend_hardware (MCP)
+                          Phase 1.5:  PREP_CHECKLIST.md (deterministic, FAST)
+                          Phase 2:    start_prepare → prep.run_id
+                          Phase 3:    local readiness check (file-existence only)
+                          Phase 4:    start_transfer(..., wait_for_prep_run_id=prep.run_id,
+                                                      auto_postflight=True)
+[user closes laptop]
+[Server side]
+  Prep pod      (small GPU; required_vram_gb=8)
+    │  headless Claude Code via claude-agent-sdk
+    │  cwd=/workspace/project; tools=Read,Edit,Write,Bash,Glob,Grep
+    │  default: "no edits"; applies MECHANICAL fixes; halts on [USER-INPUT-NEEDED]
+    │  if edits: commit + push to autoresearch/prepared-<prep.run_id>
+    ▼  supervisor reaps the pod when this Run hits terminal status
+
+  Transfer pod  (real GPU per pipeline.required_vram_gb)
+    │  workflows/transfer.py:_wait_for_prep_gate(prep.run_id)
+    │    - poll prep until terminal (15s interval, 20-min timeout)
+    │    - if [USER-INPUT-NEEDED] in prep findings → ABORT, status FAILED
+    │    - if prepared_branch in prep result → git fetch + checkout that branch
+    │  Then the existing pipeline.run() chain (preflight, pipeline, postflight LLM hooks)
+    │  Writes its own experiment_summary.md as a template fallback at terminal state
+    ▼  supervisor reaps the pod when terminal
+
+  [Supervisor tick]: sees transfer run is terminal + auto_postflight=true +
+  no postflight_run_id yet → dispatches a postflight Run with parent_run_id
+  set to the transfer's id. Sentinel `postflight_run_id` written into the
+  transfer run's params prevents double-dispatch on the next tick.
+
+  Postflight pod  (small GPU; required_vram_gb=8)
+    │  headless Claude Code; cwd=/workspace/project
+    │  tools=Read,Write,Bash
+    │  reads target run's findings/result via injected
+    │    .autoresearch_postflight_context.md
+    │  Writes autoresearch/runs/<transfer.run_id>/experiment_summary.md
+    │  with spend headline; runs git checkout/add/commit/push to
+    │  autoresearch/results-<transfer.run_id>
+    ▼  supervisor reaps the pod
+```
+
+### What ties it together
+
+- **`Run.parent_run_id`** records the spawning Run (prep is parent of nothing;
+  transfer's parent is None since it's user-initiated; postflight's parent is
+  the transfer Run). Walk the tree by `[r for r in list_runs() if r.parent_run_id == X]`.
+- **`Run.params`** carries the chain wiring: `wait_for_prep_run_id` gates
+  transfer on prep; `auto_postflight` flips on the supervisor's chain step;
+  `postflight_run_id` is the supervisor's sentinel against double-dispatch.
+- **Pods reap themselves** via the supervisor's terminal-status cleanup pass
+  (`controller/supervisor.py:tick`). The same mechanism that closes the
+  "who kills the postflight pod" bootstrap question handles all three stages
+  uniformly. No leaked compute on completed work.
+
+### What each agent's tool surface is
+
+| Agent | Workflow | Tools | Max turns | Per-agent budget cap |
+|---|---|---|---|---|
+| prep | `workflows/prepare.py` | Read, Edit, Write, Bash, Glob, Grep | 30 | $10 |
+| transfer | `workflows/transfer.py` (deterministic FSM, not an agent) | n/a | n/a | covered by `Run.budget_cap_usd` |
+| mechanic (opt-in) | `workflows/mechanic.py` (single-shot, no tools) | n/a | n/a | $10 envelope |
+| postflight | `workflows/postflight.py` | Read, Write, Bash | 20 | $10 |
+
+Per-agent caps are enforced by the SDK itself via `ClaudeAgentOptions.max_budget_usd`.
+The run-level `Run.budget_cap_usd` (default $30) is the outer envelope for the
+whole workflow, and worst-case LLM spend per `/transfer` is now 3×$10 = $30 —
+fits inside the default.
+
+### `core/agent_runner.py` — the SDK wrapper
+
+Two entry points:
+
+- `run_agent_with_tools(...)` — headless Claude Code via `claude-agent-sdk.query()`.
+  Used by prep and postflight. Async-to-sync via `asyncio.run`. Captures the
+  final assistant text, total cost from `ResultMessage`, and the list of
+  tool calls. Charges budget; emits one OBSERVATION finding per agent run.
+  Requires the `claude` CLI on PATH (the Dockerfile installs it via
+  `npm install -g @anthropic-ai/claude-code`).
+- `run_agent_single_shot(...)` — one `ModelClient.complete()` call. Used by
+  mechanic (no tool surface needed; just judges from R2 data).
+
+The SDK uses `ANTHROPIC_API_KEY` from the pod env, which `secrets.env_for_run`
+already injects. No new auth wiring.
+
+## Plugin distribution
+
+The skills + MCP server config are now shipped as a Claude Code plugin. Users
+install once:
+
+```
+/plugin marketplace add chainik1125/autoresearch
+/plugin install autoresearch@autoresearch
+```
+
+When prompted, paste the controller URL. Plugin lays down `/autoresearch:transfer`
+and `/autoresearch:make-compatible` + registers the `autoresearch` MCP server
+pointing at the user's controller. Updates flow through `/plugin update` — no
+per-project `autoresearch init` copies of the skills.
+
+Layout (in this repo):
+
+```
+.claude-plugin/
+  plugin.json        — manifest (name, version, mcpServers, userConfig)
+  marketplace.json   — single-plugin marketplace stub so this repo IS the marketplace
+mcp-config.json      — HTTP MCP wired to ${user_config.controller_url}
+skills/transfer/SKILL.md            — the /transfer skill prompt
+skills/transfer/PREP_CHECKLIST.md   — the local user-input-only checklist
+skills/make-compatible/SKILL.md     — for adapting arbitrary projects
+```
 
 ## Hardware selection module
 
@@ -606,12 +748,27 @@ Empirical (canary 13, Qwen-32B, layer 16, d_sae=102400, k=64, B200):
   the failure case but only for files named `training.log`.
 - **`Pipeline.run()` `params` is untyped.** Pydantic-typed `params` generic
   would catch input errors earlier.
-- **Pod lifecycle on terminal runs.** When `cli.py` exits 0 on FAILED to
-  defeat RunPod's container-restart, the pod stays in `RUNNING` state holding
-  the volume. New dispatches return 500. Dispatcher should auto-terminate
-  pods of terminal-status runs.
 - **`cost_per_hour` should come from the dispatched GPU type**, not the
   hardcoded H100 default in the pipeline result.
+- **Mechanic agent is opt-in and single-shot.** Real value would come from a
+  Claude Agent SDK loop polling the live run; right now it's a one-shot
+  judgement at a single moment in time.
+- **Prep agent has no apply-confirm mode.** It either edits + pushes or
+  halts on USER-INPUT-NEEDED. A "plan mode → show diff → user confirms →
+  apply" flow would be safer for substantive refactors. Today's mitigation
+  is plan-mode default + `git diff` on the pushed branch.
+- **Pod lifecycle for prep + postflight is sub-optimal.** Both are small
+  agents that don't need GPU; the dispatcher still picks a min-VRAM GPU pod
+  (~$0.20/hr). A CPU-only backend (or Modal) would be more honest about the
+  cost shape.
+
+### Resolved since last revision
+
+- ~~Pod lifecycle on terminal runs (stuck-RUNNING pods)~~ — supervisor's
+  cleanup pass now reaps them on each tick.
+- ~~Auto-select GPU from VRAM requirement~~ — `core/hardware.py:recommend`
+  does this.
+- ~~Plugin distribution~~ — autoresearch ships as a Claude Code plugin.
 
 ## Real-world example: Qwen-32B SAE training
 
