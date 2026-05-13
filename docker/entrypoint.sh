@@ -92,4 +92,36 @@ if [[ -z "${RUN_ID:-}" ]]; then
 fi
 
 echo "[entrypoint] mode=pod  RUN_ID=$RUN_ID  starting runner"
-exec autoresearch run --run-id "$RUN_ID" --heartbeat "$@"
+# Don't exec — we want to run a post-failure log-snapshot hook so that
+# diagnostic logs from a failing pipeline subprocess (e.g. a SAE training run
+# that wrote /workspace/saes/<m>/<h>/training.log) are surfaced via the
+# `list_findings` MCP tool. Without this, the only way to see those logs is to
+# spin a separate shell pod and SSH the volume — which has cost us a lot of
+# debugging time on this branch.
+autoresearch run --run-id "$RUN_ID" --heartbeat "$@"
+RUNNER_RC=$?
+
+if [[ $RUNNER_RC -ne 0 ]]; then
+    echo "[entrypoint] runner exited $RUNNER_RC; snapshotting recent training logs as findings"
+    # Snapshot the tail of any training-like log files modified in the last
+    # hour. Tail (not full content) so a giant log doesn't bloat R2.
+    find "${WORKSPACE}" -name 'training.log' -mmin -60 -type f -size +0 2>/dev/null | while read -r logf; do
+        python3 - "$logf" <<'PY' || echo "[entrypoint] WARN: log snapshot failed for $logf"
+import os, sys
+from autoresearch.config import Settings, build_storage
+from autoresearch.core.run import Run
+from autoresearch.core.findings import append, FindingType
+path = sys.argv[1]
+settings = Settings.load()
+storage = build_storage(settings)
+run = Run.load(storage, os.environ["RUN_ID"])
+with open(path) as f:
+    body = f.read()
+tail = body[-12000:] if len(body) > 12000 else body
+append(storage, run, FindingType.ERROR, f"=== {path} (last {len(tail)} chars) ===\n{tail}")
+print(f"[entrypoint] uploaded {path} ({len(tail)} chars) as ERROR finding", file=sys.stderr)
+PY
+    done
+fi
+
+exit $RUNNER_RC
