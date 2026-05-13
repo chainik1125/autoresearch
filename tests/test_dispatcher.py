@@ -239,6 +239,34 @@ def test_dispatch_falls_back_to_default_gpu_when_no_offers(tmp_path: Path) -> No
     assert compute.created[0].gpu == settings.default_gpu
 
 
+def test_dispatch_records_parent_run_id(tmp_path: Path) -> None:
+    """A dispatched-by-agent Run records its parent so the run-tree can be
+    reconstructed. Root Runs have parent_run_id=None; agent-spawned ones
+    record the spawning Run's id."""
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings()
+
+    # Root dispatch: no parent.
+    root = dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+    )
+    assert root.parent_run_id is None
+    persisted_root = Run.load(storage, root.id)
+    assert persisted_root.parent_run_id is None
+
+    # Child dispatch (simulates a prep agent spawning a compute run).
+    child = dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="y", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        parent_run_id=root.id,
+    )
+    assert child.parent_run_id == root.id
+    persisted_child = Run.load(storage, child.id)
+    assert persisted_child.parent_run_id == root.id
+
+
 def test_redispatch_swallows_termination_errors(tmp_path: Path) -> None:
     """If the old pod is already gone, redispatch must still succeed."""
     storage = LocalStorage(tmp_path / "store")

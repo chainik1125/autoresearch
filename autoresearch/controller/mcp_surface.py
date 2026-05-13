@@ -55,6 +55,7 @@ def build_mcp(
         project_repo_url: str | None = None,
         project_repo_token: str | None = None,
         project_repo_branch: str | None = None,
+        parent_run_id: str | None = None,
     ) -> dict[str, Any]:
         """Start a TRANSFER run: dispatch a pod that runs `pipeline_name`.
 
@@ -128,6 +129,7 @@ def build_mcp(
             project_repo_url=project_repo_url,
             project_repo_token=project_repo_token,
             project_repo_branch=project_repo_branch,
+            parent_run_id=parent_run_id,
         )
         return {"run_id": run.id, "status": run.status.value, "pod_handle": run.pod_handle}
 

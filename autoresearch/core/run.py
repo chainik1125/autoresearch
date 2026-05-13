@@ -43,6 +43,11 @@ class Run(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     last_heartbeat_at: datetime | None = None
     last_error: str | None = None
+    # The Run that spawned this one — set when a prep / mechanic / postflight
+    # agent (or a recursive /transfer call) dispatches downstream work. Lets
+    # the agent tree be reconstructed for introspection without inventing a
+    # separate edges table. None at the root (the user's initial dispatch).
+    parent_run_id: str | None = None
 
     @property
     def key(self) -> str:

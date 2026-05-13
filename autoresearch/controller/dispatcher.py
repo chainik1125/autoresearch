@@ -138,6 +138,7 @@ def dispatch_new(
     project_repo_url: str | None = None,
     project_repo_token: str | None = None,
     project_repo_branch: str | None = None,
+    parent_run_id: str | None = None,
 ) -> Run:
     """Create a fresh Run and launch its pod. Returns the persisted Run.
 
@@ -148,12 +149,17 @@ def dispatch_new(
         and its recommendation is honored; otherwise the deterministic
         fastest-least-complicated heuristic.
       - `settings.default_gpu` — last-resort literal.
+
+    `parent_run_id` is recorded on the new Run when an agent (prep /
+    mechanic / postflight, or a recursive /transfer call) is spawning
+    downstream work. Lets the run-tree be reconstructed for introspection.
     """
     run = Run(
         workflow=workflow,
         pipeline_name=pipeline_name,
         params=params,
         budget_cap_usd=budget_usd,
+        parent_run_id=parent_run_id,
     )
     run.save(storage)
     spec = _build_spec(
