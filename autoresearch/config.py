@@ -163,16 +163,23 @@ def build_model_client(settings: Settings):
       - Agent workflows: prepare / mechanic / postflight (via `claude-agent-sdk`).
       - MCP `summarize_run` tool.
 
-    Historically this was gated on the validator flags — which was wrong:
-    those flags only control whether transfer's *validators* run, not whether
-    a client should exist. Now we construct a client whenever the API key is
-    present, and let each consumer decide whether to use it.
+    Key lookup precedence:
+      1. `settings.anthropic_api_key` (from AUTORESEARCH_ANTHROPIC_API_KEY env var).
+      2. `os.environ.get("ANTHROPIC_API_KEY")` (the Anthropic SDK convention name,
+         which is also what `core/secrets.py:env_for_run` forwards to pods).
+
+    The fallback exists because the controller forwards `ANTHROPIC_API_KEY`
+    (no prefix) to pods — the SDK convention — but pydantic-settings here
+    reads `AUTORESEARCH_ANTHROPIC_API_KEY` (with prefix). Without the fallback,
+    pods never see the key even though it's in their env.
     """
-    if not settings.anthropic_api_key:
+    import os as _os
+    api_key = settings.anthropic_api_key or _os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
         return None
     from autoresearch.backends.models.anthropic import AnthropicClient
 
     return AnthropicClient(
-        api_key=settings.anthropic_api_key,
+        api_key=api_key,
         model=settings.validation_model,
     )

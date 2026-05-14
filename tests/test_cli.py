@@ -19,9 +19,20 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def run_cli(*args: str, env: dict[str, str] | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+def run_cli(*args: str, env: dict[str, str | None] | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    """Run autoresearch CLI in a subprocess.
+
+    `env` values may be `None` to UNSET an inherited variable (useful when a
+    test needs to assert behavior with a particular var missing — e.g.
+    ANTHROPIC_API_KEY — even when the developer's shell happens to have it
+    set).
+    """
     base_env = os.environ.copy()
-    base_env.update(env or {})
+    for k, v in (env or {}).items():
+        if v is None:
+            base_env.pop(k, None)
+        else:
+            base_env[k] = v
     return subprocess.run(
         [sys.executable, "-m", "autoresearch.cli", *args],
         cwd=cwd or REPO_ROOT,
@@ -116,9 +127,14 @@ def test_cli_agent_workflow_without_api_key_exits_zero(cli_env: dict[str, str], 
     run = Run(workflow="prepare", pipeline_name="x", params={})
     run.save(storage)
 
-    # Run with no ANTHROPIC_API_KEY set
-    env = {**cli_env, "AUTORESEARCH_STORAGE_ROOT": str(store_root)}
-    env.pop("ANTHROPIC_API_KEY", None)
+    # Run with NO ANTHROPIC_API_KEY anywhere (including inherited env from
+    # the developer's shell — the run_cli helper treats None as "unset").
+    env: dict[str, str | None] = {
+        **cli_env,
+        "AUTORESEARCH_STORAGE_ROOT": str(store_root),
+        "ANTHROPIC_API_KEY": None,
+        "AUTORESEARCH_ANTHROPIC_API_KEY": None,
+    }
     proc = run_cli("run", "--run-id", run.id, "--heartbeat", env=env)
 
     assert proc.returncode == 0, f"expected exit 0 to stop RunPod restart loop, got {proc.returncode}\nstderr: {proc.stderr}"
