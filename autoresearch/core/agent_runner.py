@@ -146,6 +146,12 @@ def run_agent_with_tools(
     that want to act on those effects (commit, push, etc.) inspect the
     working directory after this returns.
     """
+    # Pre-flight: probe the `claude` CLI directly so failures from inside
+    # the SDK's subprocess transport (which swallows stderr) are at least
+    # surfaced before we delegate. Writes an OBSERVATION finding with the
+    # captured stdout+stderr.
+    _probe_claude_cli(run=run, storage=storage, label=label)
+
     final_text, cost_usd, num_turns, tool_calls = asyncio.run(
         _query_with_tools(
             system=system, user=user, cwd=cwd,
@@ -167,6 +173,61 @@ def run_agent_with_tools(
         text=final_text, cost_usd=cost_usd,
         num_turns=num_turns, tool_calls=tool_calls,
     )
+
+
+def _probe_claude_cli(*, run: Run, storage: StorageBackend, label: str) -> None:
+    """Run `claude` CLI directly + capture stdout+stderr to a finding.
+
+    claude-agent-sdk's subprocess transport swallows stderr on non-zero
+    exit, leaving us with only "ProcessError: exit code 1". This probe
+    runs the same binary directly with a minimal headless prompt and
+    captures everything to an OBSERVATION finding, so when the SDK
+    subsequently fails we have the actual error message to diagnose.
+
+    Best-effort. Never raises. Adds ~1s to agent startup.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    parts = []
+
+    parts.append("=== which claude ===")
+    parts.append(shutil.which("claude") or "(claude not in PATH)")
+
+    parts.append("\n=== claude --version ===")
+    try:
+        out = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        parts.append(f"exit={out.returncode}\nstdout: {out.stdout.strip()}\nstderr: {out.stderr.strip()}")
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"(--version failed: {e})")
+
+    parts.append("\n=== LLM-related env keys (names only) ===")
+    parts.append("\n".join(sorted(
+        k for k in os.environ if k.startswith(("ANTHROPIC_", "CLAUDE_"))
+    )))
+
+    parts.append("\n=== minimal headless probe: echo 'reply ok' | claude --print ===")
+    try:
+        out = subprocess.run(
+            ["claude", "--print"],
+            input="reply with the single word ok and nothing else",
+            capture_output=True, text=True, timeout=30,
+        )
+        parts.append(f"exit={out.returncode}")
+        parts.append(f"stdout (head):\n{out.stdout[:2000]}")
+        parts.append(f"stderr (head):\n{out.stderr[:2000]}")
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"(probe failed: {type(e).__name__}: {e})")
+
+    body = "[claude probe pre-" + label + "]\n```\n" + "\n".join(parts) + "\n```"
+    try:
+        findings.append(storage, run, FindingType.OBSERVATION, body)
+    except Exception:  # noqa: BLE001
+        pass  # probe is best-effort; never block the agent on it
 
 
 # ---------------------------------------------------------------------------
