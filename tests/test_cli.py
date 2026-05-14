@@ -95,3 +95,36 @@ def test_cli_run_resume_after_failure(cli_env: dict[str, str], tmp_path: Path) -
     assert attempt2.returncode == 0, attempt2.stderr
     result = json.loads(attempt2.stdout)
     assert "fra_score" in result
+
+
+def test_cli_agent_workflow_without_api_key_exits_zero(cli_env: dict[str, str], tmp_path: Path) -> None:
+    """Regression: a prep/mechanic/postflight dispatch on a pod with no
+    ANTHROPIC_API_KEY must exit 0 (not 2). Otherwise RunPod's
+    restart-on-non-zero-exit will loop the pod forever, each iteration
+    failing the same way. We trade a "cleaner" non-zero exit for not
+    burning compute on a structural config gap.
+
+    Backstory: a prep dispatch ran rc=2 every 30s for hours because
+    ANTHROPIC_API_KEY was missing from the controller env. Beacons in
+    findings showed the same 01→08 trail per restart.
+    """
+    from autoresearch.backends.storage import LocalStorage
+    from autoresearch.core.run import Run, RunStatus
+
+    store_root = tmp_path / "store"
+    storage = LocalStorage(store_root)
+    run = Run(workflow="prepare", pipeline_name="x", params={})
+    run.save(storage)
+
+    # Run with no ANTHROPIC_API_KEY set
+    env = {**cli_env, "AUTORESEARCH_STORAGE_ROOT": str(store_root)}
+    env.pop("ANTHROPIC_API_KEY", None)
+    proc = run_cli("run", "--run-id", run.id, "--heartbeat", env=env)
+
+    assert proc.returncode == 0, f"expected exit 0 to stop RunPod restart loop, got {proc.returncode}\nstderr: {proc.stderr}"
+    assert "ANTHROPIC_API_KEY" in proc.stderr
+
+    # Run status must be FAILED with a clear last_error
+    fresh = Run.load(storage, run.id)
+    assert fresh.status == RunStatus.FAILED
+    assert "ANTHROPIC_API_KEY" in (fresh.last_error or "")

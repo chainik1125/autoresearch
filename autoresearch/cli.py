@@ -141,27 +141,49 @@ def cmd_run(args: argparse.Namespace) -> int:
             summarize_errors=settings.summarize_errors and model_client is not None,
             heartbeat=args.heartbeat,
         )
-    elif workflow == "prepare":
+    elif workflow in ("prepare", "mechanic", "postflight"):
+        # Agent workflows: all three need ANTHROPIC_API_KEY (the SDK reads it
+        # from env, and mechanic also uses the client object directly). If the
+        # key isn't set, exit 0 — NOT 2 — so RunPod doesn't restart-loop us
+        # on a structural config gap. Pin status=FAILED + write an ERROR
+        # finding first so the user sees what happened.
         if model_client is None:
-            print("workflow=prepare requires a model client (set ANTHROPIC_API_KEY)", file=sys.stderr)
-            return 2
-        from autoresearch.workflows.prepare import prepare as run_workflow
-        result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
-    elif workflow == "mechanic":
-        if model_client is None:
-            print("workflow=mechanic requires a model client (set ANTHROPIC_API_KEY)", file=sys.stderr)
-            return 2
-        from autoresearch.workflows.mechanic import mechanic as run_workflow
-        result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
-    elif workflow == "postflight":
-        if model_client is None:
-            print("workflow=postflight requires a model client (set ANTHROPIC_API_KEY)", file=sys.stderr)
-            return 2
-        from autoresearch.workflows.postflight import postflight as run_workflow
+            from autoresearch.core import findings as findings_mod
+            from autoresearch.core.findings import FindingType
+            from autoresearch.core.run import RunStatus as _RS
+            msg = (
+                f"workflow={workflow} requires ANTHROPIC_API_KEY to be set in "
+                f"the controller's env (it's forwarded to pods). Add it on "
+                f"Railway, then redispatch this Run."
+            )
+            print(msg, file=sys.stderr)
+            findings_mod.append(storage, run, FindingType.ERROR, msg)
+            fresh = Run.load(storage, run.id)
+            fresh.status = _RS.FAILED
+            fresh.last_error = "missing ANTHROPIC_API_KEY"
+            fresh.save(storage)
+            return 0  # exit 0 -> RunPod doesn't restart-loop
+        if workflow == "prepare":
+            from autoresearch.workflows.prepare import prepare as run_workflow
+        elif workflow == "mechanic":
+            from autoresearch.workflows.mechanic import mechanic as run_workflow
+        else:
+            from autoresearch.workflows.postflight import postflight as run_workflow
         result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
     else:
-        print(f"workflow {workflow!r} not implemented in v1", file=sys.stderr)
-        return 2
+        # Structural config gap (unknown workflow). Same exit-0 treatment as
+        # the missing-API-key path so we don't restart-loop on a typo.
+        from autoresearch.core import findings as findings_mod
+        from autoresearch.core.findings import FindingType
+        from autoresearch.core.run import RunStatus as _RS
+        msg = f"workflow {workflow!r} not implemented in v1"
+        print(msg, file=sys.stderr)
+        findings_mod.append(storage, run, FindingType.ERROR, msg)
+        fresh = Run.load(storage, run.id)
+        fresh.status = _RS.FAILED
+        fresh.last_error = msg
+        fresh.save(storage)
+        return 0
 
     print(json.dumps(result, indent=2))
     return 0

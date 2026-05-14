@@ -155,11 +155,20 @@ def build_compute(settings: Settings):
 
 
 def build_model_client(settings: Settings):
-    """Construct the validation ModelClient, or None if validators are all off."""
-    if not (settings.preflight or settings.postflight or settings.summarize_errors):
-        return None
+    """Construct an Anthropic ModelClient if an API key is configured.
+
+    The client is used by:
+      - Transfer workflow validators (preflight / postflight / summarize_errors).
+      - Hardware advisor (`core/hardware.recommend()`'s LLM layer).
+      - Agent workflows: prepare / mechanic / postflight (via `claude-agent-sdk`).
+      - MCP `summarize_run` tool.
+
+    Historically this was gated on the validator flags — which was wrong:
+    those flags only control whether transfer's *validators* run, not whether
+    a client should exist. Now we construct a client whenever the API key is
+    present, and let each consumer decide whether to use it.
+    """
     if not settings.anthropic_api_key:
-        # No key — caller may still pass model_client=None and disable validators.
         return None
     from autoresearch.backends.models.anthropic import AnthropicClient
 
