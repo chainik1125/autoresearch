@@ -1,7 +1,15 @@
-# Single image, two roles. MODE=serve -> controller (Railway). MODE=pod -> runner (RunPod).
+# Thin pod image. Contains everything that rarely changes (Python + Node + claude CLI
+# + autoresearch's pinned third-party deps), but NOT the autoresearch source itself.
+# The entrypoint git-clones autoresearch fresh at every pod boot, so code changes
+# ship by `git push main` + dispatching a new pod — no image rebuild needed.
 #
-# Base: RunPod's PyTorch 2.4 / CUDA 12.4 / Python 3.11 image. Already has torch, CUDA,
-# transformers-friendly stack — saves first-pod cold-start time. ~10GB.
+# Image rebuild only required when: a Python dep is added/upgraded in pyproject.toml,
+# an apt package is added, the RunPod base bumps, or the Node / claude CLI version
+# changes. See .github/workflows/build-image.yml for the path filter that enforces
+# this.
+#
+# MODE=serve is no longer supported on this image (Railway builds the controller
+# from source via `railway up`).
 
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
@@ -11,34 +19,35 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     PYTHONUNBUFFERED=1
 
-# git is needed for the pod entrypoint's optional `PROJECT_REPO_URL` clone.
-# hf-transfer accelerates HF Hub downloads when HF_HUB_ENABLE_HF_TRANSFER=1.
-# nodejs + @anthropic-ai/claude-code give us a headless `claude` CLI on the
-# pod so the prep / postflight workflows can drive a real Claude Agent SDK
-# loop via the `claude-agent-sdk` Python package (which shells out to the
-# CLI under the hood).
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+# System packages + Node + claude CLI + hf-transfer. openssh-server is added
+# explicitly so the entrypoint's sshd debug path works on a minimal base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates curl gnupg openssh-server \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir hf-transfer
 
-# Bake the package into the image. Any package change requires rebuild + push.
-# Also copy autoresearch.toml so the controller has its project config at /app —
-# pydantic-settings reads from cwd, and the entrypoint runs from /app.
-WORKDIR /app
-COPY pyproject.toml README.md autoresearch.toml ./
-COPY autoresearch ./autoresearch
-RUN pip install --no-cache-dir .
+# Install ONLY autoresearch's third-party deps (extracted from pyproject.toml).
+# The autoresearch package itself is git-cloned at runtime by the entrypoint;
+# at that point we run `pip install --no-deps -e .` against the clone, which
+# only registers the package + console script (the deps are already here).
+COPY pyproject.toml /tmp/pyproject.toml
+RUN python3 -c "import tomllib; \
+import sys; \
+deps = tomllib.load(open('/tmp/pyproject.toml','rb'))['project']['dependencies']; \
+print('\n'.join(deps))" > /tmp/deps.txt \
+    && pip install --no-cache-dir -r /tmp/deps.txt \
+    && rm /tmp/pyproject.toml /tmp/deps.txt
 
-# Entrypoint dispatches on $MODE.
+# The entrypoint git-clones autoresearch into /app at runtime.
+RUN mkdir -p /app
+WORKDIR /app
+
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Controller HTTP port (FastAPI). Pods don't need this published.
 EXPOSE 8000
-
-# Default to pod mode; Railway overrides with MODE=serve.
 ENV MODE=pod
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

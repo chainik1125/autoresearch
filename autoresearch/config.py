@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     controller_host: str = "0.0.0.0"
     controller_port: int = 8000
     base_image_tag: str | None = None
+    # Git ref the pod entrypoint checks out for autoresearch source. The thin
+    # pod image (see Dockerfile) doesn't bake source in; it git-clones at
+    # boot. Defaults to "main"; override per-dispatch to test feature
+    # branches without rebuilding the image.
+    autoresearch_ref: str = "main"
     project_repo_url: str | None = None       # cloned onto the pod's persistent volume on first boot
     project_repo_token: str | None = None     # GitHub PAT for private-repo cloning (optional)
     project_repo_branch: str | None = None    # specific branch to clone; default = remote's HEAD

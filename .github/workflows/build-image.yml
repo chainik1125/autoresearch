@@ -1,17 +1,28 @@
-name: Build & push controller image
+name: Build & push pod image
 
-# Triggers on every push to main + manual dispatch. Produces a multi-tag image
-# at ghcr.io/<owner>/<repo>:
+# THIN POD IMAGE. Contains only third-party deps (Python + Node + claude CLI +
+# pinned dependencies). The autoresearch source is git-cloned by the pod at
+# runtime, so source-only changes do NOT require an image rebuild.
+#
+# Triggers only on changes to infrastructure-affecting files. Most commits
+# (workflows/, controller/, core/, etc.) skip the rebuild entirely.
+#
+# Tags produced:
 #   - latest             (only from default branch)
-#   - sha-<short-sha>    (every build; this is the tag you pin in autoresearch.toml)
+#   - sha-<short-sha>    (every build; pin in autoresearch.toml if you want to
+#                         freeze the infra image alongside a source SHA)
 #   - <branch-name>      (per-branch tag for testing)
 #
-# The image is ~10GB (RunPod's PyTorch base + our package). First build ~15min;
-# subsequent code-only builds ~2min thanks to GHA layer cache.
+# First build ~15min cold; subsequent builds ~2min via GHA layer cache.
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'docker/entrypoint.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/build-image.yml'
   workflow_dispatch:
 
 env:

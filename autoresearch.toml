@@ -12,6 +12,12 @@ compute = "runpod"
 default_gpu = "H100 80GB"                      # H100 / A100-80GB fit Qwen-32B at fp16; A40 needs quantization
 runpod_data_center = "US-CA-2"
 runpod_network_volume_id = "l7wyka84iy"        # 1TB, autoresearch-fra (US-CA-2)
+# Thin pod image: only third-party deps are baked in. The pod git-clones
+# autoresearch source at boot (see docker/entrypoint.sh) so source changes
+# ship by `git push main` + dispatching a new pod — no image rebuild.
+# Pin a SHA tag here if you want to freeze the infra image alongside a
+# specific deployment; otherwise `:latest` follows the most recent infra
+# build (only triggered by Dockerfile / pyproject.toml / entrypoint changes).
 runpod_default_image = "ghcr.io/chainik1125/autoresearch:latest"
 runpod_container_registry_auth_id = "cmp2b493n0051ju07mlw41yu1"  # ghcr-autoresearch, points at GIT_PAT
 

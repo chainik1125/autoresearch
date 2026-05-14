@@ -53,6 +53,11 @@ def env_for_run(
         # Pipeline workspace lives on the network volume so logs and
         # intermediate state survive pod restarts (cli.py reads this).
         "WORKSPACE_DIR": "/workspace",
+        # Git ref the pod entrypoint checks out for autoresearch source.
+        # Image only ships third-party deps; source is git-cloned at boot.
+        # Override per-dispatch to run a feature branch without rebuilding
+        # the image.
+        "AUTORESEARCH_REF": settings.autoresearch_ref,
 
         "AUTORESEARCH_STORAGE": settings.storage,
         "AUTORESEARCH_STORAGE_BUCKET": settings.storage_bucket or "",
