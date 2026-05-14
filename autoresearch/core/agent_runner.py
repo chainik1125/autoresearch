@@ -94,7 +94,16 @@ async def _query_with_tools(
         allowed_tools=allowed_tools,
         max_turns=max_turns,
         max_budget_usd=max_budget_usd,
-        permission_mode="bypassPermissions",
+        # NOTE: cannot use "bypassPermissions" — Claude CLI refuses it when
+        # running as root (which the pod is by default). Verified via
+        # _probe_claude_cli output: "--dangerously-skip-permissions cannot
+        # be used with root/sudo privileges for security reasons."
+        # `acceptEdits` auto-approves file edits in headless mode; with the
+        # tool allow-list constrained to Read/Edit/Write/Bash/Glob/Grep at
+        # the workflow level, this is functionally equivalent for our
+        # prep/postflight agents. To get the truly-skip-everything behavior
+        # we'd need to run claude as a non-root user in the Dockerfile.
+        permission_mode="acceptEdits",
     )
 
     final_text = ""
@@ -241,7 +250,7 @@ def _probe_claude_cli(*, run: Run, storage: StorageBackend, label: str) -> None:
     except Exception as e:  # noqa: BLE001
         parts.append(f"(--help failed: {e})")
 
-    parts.append("\n=== SDK-style probe: full flag set used by claude_agent_sdk ===")
+    parts.append("\n=== SDK-style probe: full flag set used by claude_agent_sdk (acceptEdits mode) ===")
     try:
         out = subprocess.run(
             [
@@ -252,7 +261,7 @@ def _probe_claude_cli(*, run: Run, storage: StorageBackend, label: str) -> None:
                 "--allowedTools", "",
                 "--max-turns", "1",
                 "--max-budget-usd", "0.01",
-                "--permission-mode", "bypassPermissions",
+                "--permission-mode", "acceptEdits",
                 "--print",
             ],
             input="say ok",
