@@ -76,6 +76,9 @@ async def _query_with_tools(
     allowed_tools: list[str],
     max_turns: int,
     max_budget_usd: float,
+    run: Run | None = None,
+    storage: StorageBackend | None = None,
+    label: str = "agent",
 ) -> tuple[str, float, int, list[tuple[str, dict[str, Any]]]]:
     # Import inside the function so the SDK isn't required for tests that
     # only exercise the single-shot path.
@@ -110,22 +113,54 @@ async def _query_with_tools(
     cost_usd = 0.0
     num_turns = 0
     tool_calls: list[tuple[str, dict[str, Any]]] = []
+    turn_idx = 0
+
+    def _stream(body: str) -> None:
+        """Write a streaming finding so we can watch the agent live.
+        Best-effort; never raises (the SDK loop must not stop on a log failure)."""
+        if run is None or storage is None:
+            return
+        try:
+            findings.append(storage, run, FindingType.OBSERVATION, body)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _stream(f"[{label}] sdk loop started")
 
     async for msg in query(prompt=user, options=options):
         if isinstance(msg, AssistantMessage):
+            turn_idx += 1
+            turn_text_parts: list[str] = []
+            turn_tool_parts: list[str] = []
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     # Keep the most recent assistant text — the SDK delivers
                     # one final text turn after tool use is done.
                     final_text = block.text
+                    turn_text_parts.append(block.text[:1500])
                 elif isinstance(block, ToolUseBlock):
                     tool_calls.append((block.name, block.input))
+                    # Compact one-line tool summary for live finding
+                    input_repr = str(block.input)[:300]
+                    turn_tool_parts.append(f"{block.name}({input_repr})")
+            # Stream this turn so we can watch the agent in real time
+            lines = [f"[{label}] turn {turn_idx}"]
+            if turn_text_parts:
+                lines.append("text: " + " | ".join(turn_text_parts)[:2000])
+            if turn_tool_parts:
+                lines.append("tools: " + "; ".join(turn_tool_parts)[:2000])
+            _stream("\n".join(lines))
         elif isinstance(msg, ResultMessage):
             cost_usd = msg.total_cost_usd or 0.0
             num_turns = msg.num_turns
             if msg.result:
                 final_text = msg.result
+            _stream(
+                f"[{label}] sdk result: {num_turns} turns, ${cost_usd:.4f}, "
+                f"stop_reason={getattr(msg, 'stop_reason', '?')}"
+            )
 
+    _stream(f"[{label}] sdk loop exited cleanly ({turn_idx} assistant turns observed)")
     return final_text, cost_usd, num_turns, tool_calls
 
 
@@ -166,6 +201,7 @@ def run_agent_with_tools(
             system=system, user=user, cwd=cwd,
             allowed_tools=allowed_tools, max_turns=max_turns,
             max_budget_usd=max_budget_usd,
+            run=run, storage=storage, label=label,
         )
     )
     if cost_usd > 0:
