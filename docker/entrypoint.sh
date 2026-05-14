@@ -22,29 +22,11 @@ set -uo pipefail
 
 MODE="${MODE:-pod}"
 
-if [[ "$MODE" == "serve" ]]; then
-    # This thin pod image no longer contains autoresearch source — only the
-    # third-party deps. Railway builds the controller from source via
-    # `railway up`. If you're seeing this, you booted the pod image in
-    # controller mode by accident.
-    echo "[entrypoint] FATAL: mode=serve not supported on the thin pod image." >&2
-    echo "[entrypoint] Controller is hosted on Railway via 'railway up'." >&2
-    exit 1
-fi
-
-# --- pod mode ---
-
-# Clone autoresearch source. The image only has third-party deps; the package
-# itself is fetched fresh at each boot so code changes ship via `git push main`
-# without rebuilding the image. AUTORESEARCH_REF (set by the dispatcher,
-# default "main") pins the ref so we can dispatch feature branches without
-# touching infra.
-#
-# Beacon 00 fires AFTER the install so we know the source actually loaded.
-# If the clone or install fails, the entrypoint exits before beacon 00 can
-# fire, and the failure is visible in the pod's RunPod-side status (RunPod's
-# REST API doesn't expose container logs, but the absence of finding 00
-# combined with the pod exiting fast is diagnostic enough).
+# Both modes (serve + pod) git-clone autoresearch source. The image only
+# carries third-party deps; the package itself is fetched fresh at each
+# boot so code changes ship via `git push main` without rebuilding the
+# image. AUTORESEARCH_REF (default "main") pins the ref — used by the
+# dispatcher to test feature branches.
 AUTORESEARCH_REF="${AUTORESEARCH_REF:-main}"
 echo "[entrypoint] cloning autoresearch @ ${AUTORESEARCH_REF} into /app"
 if [[ ! -d /app/.git ]]; then
@@ -56,15 +38,24 @@ else
 fi
 cd /app
 pip install --no-deps -e .
-
-# First beacon — only reachable AFTER autoresearch installed successfully.
-# Records which git ref we're running.
 GIT_SHA=$(git -C /app rev-parse --short HEAD 2>/dev/null || echo "unknown")
+echo "[entrypoint] autoresearch source ready @ ${AUTORESEARCH_REF} (${GIT_SHA})"
+
+if [[ "$MODE" == "serve" ]]; then
+    # Controller mode (Railway). cwd is /app so Settings.load() finds
+    # autoresearch.toml and templates/ + pipelines/.
+    echo "[entrypoint] mode=serve; starting controller"
+    exec autoresearch serve "$@"
+fi
+
+# --- pod mode ---
+
+# Beacon 00 confirms the source actually loaded on the pod (writes to R2).
+# Controller mode doesn't write findings (no RUN_ID), so beacons are
+# pod-only diagnostics.
 python3 -m autoresearch.boot_beacon "00 autoresearch source @ ${AUTORESEARCH_REF} (${GIT_SHA}) ready" || true
 
-# Second beacon: prove we got past argument-parsing / interpreter startup.
-# If this finding never appears, the failure is in the image itself (pull,
-# entrypoint syntax, base image init) — not in subsequent steps.
+# Beacon 01: prove we got past argument-parsing / interpreter startup.
 python3 -m autoresearch.boot_beacon "01 entrypoint started; mode=pod, RUN_ID=${RUN_ID:-<unset>}" || true
 
 # Start sshd in the background so the pod is shell-accessible for debugging.
