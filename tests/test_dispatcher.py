@@ -402,6 +402,72 @@ def test_agent_workflow_dispatches_cpu_pod_by_default(tmp_path: Path) -> None:
     assert spec.gpu == []  # explicitly empty
 
 
+def test_cpu_dispatch_falls_back_no_volume_when_primary_dc_out_of_stock(tmp_path: Path) -> None:
+    """Regression: when the primary DC has no CPU stock (RunPod 500
+    'no instances available'), CPU dispatches retry without the network
+    volume so RunPod can place the pod in any DC.
+
+    Backstory: a real US-CA-2 outage on 2026-05-14 made all GPU + CPU SKUs
+    return 500. Agent workflows don't actually need the volume contents
+    (they're shell + LLM + git, no model downloads), so we drop the volume
+    on retry to unblock.
+    """
+    storage = LocalStorage(tmp_path / "store")
+    settings = _settings()
+
+    class FlakyThenOK(FakeCompute):
+        def __init__(self):
+            super().__init__()
+            self._attempts = 0
+
+        def create_session(self, spec):
+            self._attempts += 1
+            if self._attempts == 1:
+                # Simulate the RunPod 500 we see in real life
+                raise RuntimeError(
+                    "create pod: There are no longer any instances available "
+                    "with the requested specifications. Please refresh and try again."
+                )
+            return super().create_session(spec)
+
+    compute = FlakyThenOK()
+    run = dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        compute_type="CPU",
+    )
+
+    # First attempt was with volume; second was without
+    assert compute._attempts == 2
+    assert compute.created[0].network_volume_id == ""  # the retry spec
+    # The original spec (before retry) had the volume; the retry stripped it.
+    # The Run record reflects the volume_dropped fallback.
+    hw = run.params["_dispatched_hardware"]
+    assert hw.get("volume_dropped") is True
+    assert "fallback DC" in hw.get("note", "")
+
+
+def test_gpu_dispatch_does_not_fall_back_no_volume(tmp_path: Path) -> None:
+    """The volume-drop fallback must NOT fire for compute_type='GPU' — the
+    transfer workflow needs the volume's HF cache + outputs. Better to fail
+    loud than silently dispatch a GPU pod that'll re-download everything.
+    """
+    storage = LocalStorage(tmp_path / "store")
+    settings = _settings()
+
+    class AlwaysNoStock(FakeCompute):
+        def create_session(self, spec):
+            raise RuntimeError("create pod: There are no instances currently available")
+
+    compute = AlwaysNoStock()
+    with pytest.raises(RuntimeError, match="no instances"):
+        dispatcher.dispatch_new(
+            workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+            budget_usd=10, settings=settings, storage=storage, compute=compute,
+            gpu="H100 80GB",
+        )
+
+
 def test_agent_workflow_no_fallback_raises_when_catalog_empty(tmp_path: Path) -> None:
     """With fallback_to_default=False, a missing catalog must fail loudly
     rather than silently dispatch on settings.default_gpu (which is "H100

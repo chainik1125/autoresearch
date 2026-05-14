@@ -256,7 +256,32 @@ def dispatch_new(
         cpu_flavors=cpu_flavors,
         vcpu_count=vcpu_count,
     )
-    handle = compute.create_session(spec)
+    # CPU dispatches can fall back to ANY DC (no volume) if the primary DC
+    # is out of stock. Agent workflows (prep/mechanic/postflight) don't need
+    # the volume contents — they're shell + LLM + git, no model downloads.
+    # Pipeline workloads (transfer) DO need the volume, so this fallback
+    # only fires for compute_type='CPU'.
+    handle = None
+    volume_dropped = False
+    try:
+        handle = compute.create_session(spec)
+    except Exception as primary_err:  # noqa: BLE001
+        if (
+            spec.compute_type == "CPU"
+            and spec.network_volume_id
+            and _looks_like_no_stock(primary_err)
+        ):
+            # Rebuild spec without the volume so RunPod can place us anywhere.
+            spec_no_vol = spec.model_copy(update={"network_volume_id": ""})
+            try:
+                handle = compute.create_session(spec_no_vol)
+                volume_dropped = True
+                spec = spec_no_vol
+            except Exception:  # noqa: BLE001 -- fallback failed too; raise original
+                raise primary_err from None
+        else:
+            raise
+
     run.pod_handle = handle.id
     run.status = RunStatus.QUEUED
     # Stash hardware spec into params so `get_run` shows what was requested.
@@ -273,9 +298,26 @@ def dispatch_new(
         hw_audit["gpu"] = spec.gpu if isinstance(spec.gpu, list) else [spec.gpu]
         if required_vram_gb is not None:
             hw_audit["required_vram_gb"] = required_vram_gb
+    if volume_dropped:
+        hw_audit["volume_dropped"] = True
+        hw_audit["note"] = "primary DC out of stock; dispatched in fallback DC without volume"
     run.params = {**(run.params or {}), "_dispatched_hardware": hw_audit}
     run.save(storage)
     return run
+
+
+def _looks_like_no_stock(exc: Exception) -> bool:
+    """Heuristic: did `compute.create_session` fail because the target DC is
+    out of stock (vs. a real error like auth, malformed body, etc.)?
+
+    RunPod returns 500 with bodies like `"create pod: There are no longer
+    any instances available with the requested specifications"` or `"create
+    pod: There are no instances currently available"`. We sniff for these
+    strings rather than relying on the HTTP status alone (500 is too
+    generic).
+    """
+    msg = str(exc).lower()
+    return "no instances" in msg or "no longer any instances" in msg or "no instance" in msg
 
 
 def redispatch(

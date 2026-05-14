@@ -76,7 +76,10 @@ class RunPodCompute:
         body: dict[str, Any] = {
             "name": spec.name or "autoresearch-pod",
             "imageName": spec.image,
-            "networkVolumeId": spec.network_volume_id,
+            # Empty string means "no volume — let RunPod place us in any DC."
+            # The dispatcher uses this for CPU agent fallback when the
+            # primary DC is out of stock.
+            "networkVolumeId": spec.network_volume_id or None,
             "containerDiskInGb": spec.container_disk_gb,
             "env": dict(spec.env),
             "ports": ports or None,                  # RunPod expects array, not comma-joined string
