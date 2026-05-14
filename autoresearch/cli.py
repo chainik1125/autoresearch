@@ -169,7 +169,36 @@ def cmd_run(args: argparse.Namespace) -> int:
             from autoresearch.workflows.mechanic import mechanic as run_workflow
         else:
             from autoresearch.workflows.postflight import postflight as run_workflow
-        result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
+
+        # Bracket the workflow call with diagnostic findings + a try/except.
+        # Without this, any exception inside the workflow propagates out, the
+        # process exits 1, RunPod restart-loops, and we have ZERO visibility
+        # into what actually failed. Now we capture the traceback as an
+        # ERROR finding, mark the Run FAILED, and exit 0 so RunPod stops
+        # restarting. The user sees the failure via list_findings.
+        from autoresearch.core import findings as findings_mod
+        from autoresearch.core.findings import FindingType
+        from autoresearch.core.run import RunStatus as _RS
+
+        findings_mod.append(
+            storage, run, FindingType.OBSERVATION,
+            f"[cli] starting workflow={workflow} pipeline={pipeline_name}",
+        )
+        try:
+            result = run_workflow(run, storage=storage, workspace=workspace, model_client=model_client)
+        except Exception as exc:  # noqa: BLE001 -- capture-everything by design
+            import traceback as _tb
+            tb_text = _tb.format_exc()
+            findings_mod.append(
+                storage, run, FindingType.ERROR,
+                f"workflow={workflow} crashed: {type(exc).__name__}: {exc}\n\n```\n{tb_text}\n```",
+            )
+            fresh = Run.load(storage, run.id)
+            fresh.status = _RS.FAILED
+            fresh.last_error = f"{type(exc).__name__}: {str(exc)[:500]}"
+            fresh.save(storage)
+            print(f"workflow {workflow} crashed: {exc}", file=sys.stderr)
+            return 0  # exit 0 -> RunPod stops restart-looping
     else:
         # Structural config gap (unknown workflow). Same exit-0 treatment as
         # the missing-API-key path so we don't restart-loop on a typo.
