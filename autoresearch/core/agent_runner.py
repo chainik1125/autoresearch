@@ -223,6 +223,47 @@ def _probe_claude_cli(*, run: Run, storage: StorageBackend, label: str) -> None:
     except Exception as e:  # noqa: BLE001
         parts.append(f"(probe failed: {type(e).__name__}: {e})")
 
+    parts.append("\n=== claude --help (flag inventory) ===")
+    try:
+        out = subprocess.run(
+            ["claude", "--help"], capture_output=True, text=True, timeout=10,
+        )
+        # Filter to flag names + check the ones the SDK uses
+        relevant = [
+            ln for ln in (out.stdout + out.stderr).splitlines()
+            if any(f in ln for f in [
+                "--output-format", "--verbose", "--system-prompt",
+                "--allowedTools", "--max-turns", "--max-budget-usd",
+                "--permission-mode", "--print",
+            ])
+        ]
+        parts.append("\n".join(relevant) or "(no relevant flags in --help)")
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"(--help failed: {e})")
+
+    parts.append("\n=== SDK-style probe: full flag set used by claude_agent_sdk ===")
+    try:
+        out = subprocess.run(
+            [
+                "claude",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--system-prompt", "you are a test",
+                "--allowedTools", "",
+                "--max-turns", "1",
+                "--max-budget-usd", "0.01",
+                "--permission-mode", "bypassPermissions",
+                "--print",
+            ],
+            input="say ok",
+            capture_output=True, text=True, timeout=20,
+        )
+        parts.append(f"exit={out.returncode}")
+        parts.append(f"stdout (head):\n{out.stdout[:2000]}")
+        parts.append(f"stderr (head):\n{out.stderr[:2000]}")
+    except Exception as e:  # noqa: BLE001
+        parts.append(f"(SDK-style probe failed: {type(e).__name__}: {e})")
+
     body = "[claude probe pre-" + label + "]\n```\n" + "\n".join(parts) + "\n```"
     try:
         findings.append(storage, run, FindingType.OBSERVATION, body)
