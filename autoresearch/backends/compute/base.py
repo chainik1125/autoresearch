@@ -20,10 +20,18 @@ from pydantic import BaseModel, Field
 
 
 class SessionSpec(BaseModel):
-    # Either a single GPU type ("H100 80GB") OR a list of acceptable types in
-    # preference order. The backend picks the first one with current inventory.
-    # See `core/hardware.py` for the selection logic that produces the list.
-    gpu: str | list[str]
+    # Compute selection:
+    #   compute_type="GPU" (default): `gpu` is a single type or preference-ordered list;
+    #     backend picks the first with current inventory. `cpu_flavors`/`vcpu_count` ignored.
+    #   compute_type="CPU": `cpu_flavors` is a preference-ordered list of RunPod CPU
+    #     flavor IDs (e.g. ["cpu3c", "cpu5c"]); `vcpu_count` picks the vCPU bucket within
+    #     the chosen flavor. `gpu` may be left as an empty list. CPU pods are ~$0.05/hr
+    #     vs. ~$0.17-2.69/hr for the cheapest-to-pricey GPU bracket — use for agent
+    #     workflows (prep/mechanic/postflight) where there's no GPU compute.
+    compute_type: Literal["GPU", "CPU"] = "GPU"
+    gpu: str | list[str] = Field(default_factory=list)
+    cpu_flavors: list[str] = Field(default_factory=list)
+    vcpu_count: int = 4
     image: str                                 # Docker image
     network_volume_id: str                     # required: where the HF cache & user pipelines live
     env: dict[str, str] = Field(default_factory=dict)  # injected into the pod

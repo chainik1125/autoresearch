@@ -11,7 +11,7 @@ storage_region = "auto"
 compute = "runpod"
 default_gpu = "H100 80GB"                      # H100 / A100-80GB fit Qwen-32B at fp16; A40 needs quantization
 runpod_data_center = "US-CA-2"
-runpod_network_volume_id = "l7wyka84iy"        # 200GB, autoresearch-fra
+runpod_network_volume_id = "l7wyka84iy"        # 1TB, autoresearch-fra (US-CA-2)
 runpod_default_image = "ghcr.io/chainik1125/autoresearch:latest"
 runpod_container_registry_auth_id = "cmp2b493n0051ju07mlw41yu1"  # ghcr-autoresearch, points at GIT_PAT
 

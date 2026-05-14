@@ -283,3 +283,79 @@ def test_redispatch_swallows_termination_errors(tmp_path: Path) -> None:
     )
     fresh = dispatcher.redispatch(run, settings=settings, storage=storage, compute=compute)
     assert fresh.pod_handle == "pod-2"  # didn't crash on terminate failure
+
+
+def test_agent_workflow_picks_cheapest_not_default_gpu(tmp_path: Path) -> None:
+    """Regression: agent workflows (prepare/mechanic/postflight) must use the
+    cheapest sufficient GPU, not silently fall through to settings.default_gpu.
+
+    Backstory: a prep dispatch landed on H200 ($5.49/hr) for a 30-second LLM
+    call because (a) prep's required_vram_gb resolution returned no picks,
+    (b) the dispatcher fell back to default_gpu="H100 80GB", which RunPod
+    fuzzy-matched to whatever 80GB+ SKU had stock. ~5000x cost overrun.
+    """
+    offers = [
+        GpuOffer(id="NVIDIA RTX A4000", memory_gb=16, price_per_hour=0.17, available_in_dc=True),
+        GpuOffer(id="NVIDIA RTX A5000", memory_gb=24, price_per_hour=0.26, available_in_dc=True),
+        GpuOffer(id="NVIDIA H100 80GB HBM3", memory_gb=80, price_per_hour=2.69, available_in_dc=True),
+    ]
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute(offers=offers)
+    settings = _settings(runpod_data_center="US-CA-2")
+
+    dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        required_vram_gb=8,
+        prefer="cheapest",
+        fallback_to_default=False,
+    )
+    picked = compute.created[0].gpu
+    assert isinstance(picked, list)
+    # Cheapest sufficient: A4000 at $0.17/hr, then A5000, then (way) H100.
+    assert picked[0] == "NVIDIA RTX A4000"
+    assert "NVIDIA H100 80GB HBM3" in picked  # still available as final fallback
+
+
+def test_agent_workflow_dispatches_cpu_pod_by_default(tmp_path: Path) -> None:
+    """Regression: when compute_type='CPU', the SessionSpec must have CPU
+    fields populated and the GPU path must be skipped entirely.
+
+    Backstory: agent workflows (prep / mechanic / postflight) are pure
+    LLM+shell+git workloads with no GPU compute. Dispatching them on the
+    cheapest GPU pod (~$0.17/hr) is still ~4x what a CPU pod costs
+    (~$0.05/hr). This test pins the CPU default.
+    """
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()  # no offers — CPU path doesn't consult catalog
+    settings = _settings()
+
+    dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        compute_type="CPU",
+    )
+    spec = compute.created[0]
+    assert spec.compute_type == "CPU"
+    assert spec.cpu_flavors == ["cpu3c", "cpu5c"]  # the defaults
+    assert spec.vcpu_count == 4
+    assert spec.gpu == []  # explicitly empty
+
+
+def test_agent_workflow_no_fallback_raises_when_catalog_empty(tmp_path: Path) -> None:
+    """With fallback_to_default=False, a missing catalog must fail loudly
+    rather than silently dispatch on settings.default_gpu (which is "H100
+    80GB" — an order-of-magnitude cost mistake for an LLM-only workload).
+    """
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute(offers=[])  # empty catalog
+    settings = _settings()
+
+    with pytest.raises(ValueError, match="fallback_to_default=False"):
+        dispatcher.dispatch_new(
+            workflow="prepare", pipeline_name="x", params={},
+            budget_usd=10, settings=settings, storage=storage, compute=compute,
+            required_vram_gb=8,
+            prefer="cheapest",
+            fallback_to_default=False,
+        )

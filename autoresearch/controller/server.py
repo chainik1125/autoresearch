@@ -34,7 +34,10 @@ def create_app() -> FastAPI:
     model_client = build_model_client(settings)
 
     supervisor = (
-        Supervisor(settings=settings, storage=storage, compute=compute)
+        Supervisor(
+            settings=settings, storage=storage, compute=compute,
+            model_client=model_client,
+        )
         if compute is not None
         else None
     )

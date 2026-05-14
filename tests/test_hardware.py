@@ -225,6 +225,76 @@ def test_recommend_falls_back_to_deterministic_on_bad_advisor_json() -> None:
     assert rec.picks[0] == "L40S"
 
 
+def test_recommend_invokes_advisor_for_cheapest_prefer_too() -> None:
+    """Regression: even when caller asks for `prefer='cheapest'`, the advisor
+    is still invoked (not short-circuited to deterministic-only). The whole
+    point of Claude-in-the-loop is to apply context the ranker can't see —
+    skipping the advisor for agent workflows defeats that.
+
+    Setup: deterministic ranker would pick A4000 (cheapest sufficient).
+    Advisor overrides with A5000 citing a hypothetical past failure on A4000.
+    We assert the advisor's override was honored.
+    """
+    offers = [
+        _offer("A4000", 16, 0.17),
+        _offer("A5000", 24, 0.26),
+        _offer("L4",    24, 0.43),
+    ]
+    advisor_response = json.dumps({
+        "picks": ["A5000", "L4"],
+        "confidence": "high",
+        "rationale": "A4000 OOM'd on last prep run with sae_lens deps; A5000 is the next cheapest with margin.",
+        "alternatives": [],
+    })
+    client = _FakeClient(response_text=advisor_response)
+    rec = recommend(
+        offers,
+        required_vram_gb=8,
+        data_center_id="US-CA-2",
+        intent="prep agent: cheap + reliable",
+        pipeline_name="prep",
+        workflow="prepare",
+        client=client,
+        prefer="cheapest",  # the key bit — advisor still consulted
+    )
+    assert rec.picks == ["A5000", "L4"]    # advisor's override won
+    assert "A4000 OOM" in rec.rationale     # context made it through
+
+
+def test_recommend_drops_advisor_picks_out_of_dc_stock() -> None:
+    """Regression: an advisor pick for a SKU marked OUT OF STOCK in the
+    target DC must be dropped, even though VRAM is sufficient.
+
+    Backstory: a real /transfer dispatch landed on B200 even though B200
+    wasn't in US-CA-2 stock. The advisor saw B200 in the offers table
+    (with the OOS marker for context), picked it anyway, and validation
+    only checked VRAM — not DC stock. Result: dispatch 422'd, user paid
+    for the failed attempt.
+    """
+    offers = [
+        _offer("A40",  48, None),      # OUT OF STOCK in US-CA-2 (price=None)
+        _offer("L40S", 48, 0.79),      # in stock
+        _offer("B200", 180, None),     # OUT OF STOCK (price=None)
+    ]
+    advisor_response = json.dumps({
+        "picks": ["B200", "L40S"],     # advisor picks B200 first, despite OOS marker
+        "confidence": "high",
+        "rationale": "B200 is newest gen.",
+        "alternatives": [],
+    })
+    client = _FakeClient(response_text=advisor_response)
+    rec = recommend(
+        offers,
+        required_vram_gb=30,
+        data_center_id="US-CA-2",
+        intent="x",
+        client=client,
+    )
+    # B200 filtered out (OOS), only L40S survives.
+    assert "B200" not in rec.picks
+    assert rec.picks == ["L40S"]
+
+
 def test_recommend_drops_hallucinated_advisor_picks() -> None:
     """Advisor names a GPU that isn't in offers → it's dropped, not blindly trusted."""
     offers = [_offer("L40S", 48, 0.79)]

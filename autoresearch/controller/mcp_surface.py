@@ -160,8 +160,24 @@ def build_mcp(
 
     @mcp.tool()
     def tail_log(run_id: str, lines: int = 200) -> str:
-        """Tail the last N lines of the run's logs."""
-        return logs.tail(storage, Run.load(storage, run_id), lines=lines)
+        """Tail the last N lines of the run's logs.
+
+        Empty output usually means the pod never wrote a log — most likely
+        boot-stalled (image pull failed, entrypoint crashed). Check
+        `list_findings(run_id)` for a `BOOT-STALLED` ERROR finding from
+        the supervisor.
+        """
+        run = Run.load(storage, run_id)
+        body = logs.tail(storage, run, lines=lines)
+        if body.strip():
+            return body
+        # Empty — surface why. Saves a round-trip to list_findings just to
+        # discover the pod never booted.
+        if run.status == RunStatus.FAILED and run.last_error:
+            return f"(no log lines written by the pod — Run is FAILED: {run.last_error})"
+        if run.status == RunStatus.QUEUED:
+            return "(no log lines yet — pod may still be booting; if this persists >12 min, check list_findings for BOOT-STALLED)"
+        return "(no log lines yet)"
 
     @mcp.tool()
     def list_findings(run_id: str, since_cursor: str | None = None) -> list[dict[str, Any]]:
@@ -271,17 +287,28 @@ def build_mcp(
         project_repo_token: str | None = None,
         budget_usd: float | None = None,
         parent_run_id: str | None = None,
+        gpu: str | list[str] | None = None,
+        required_vram_gb: int | None = None,
+        compute_type: str = "CPU",
     ) -> dict[str, Any]:
-        """Dispatch a PREPARE Run — pre-flight static review of the project.
+        """Dispatch a PREPARE Run — pre-flight code review + disk hygiene.
 
-        Single-shot LLM call (in v0) that reviews the project's pipeline
-        class + tree for blockers to unattended dispatch (hardcoded paths,
-        missing env vars, dep issues). Defaults to plan-mode: reports
-        findings but doesn't yet apply patches (that's v1).
+        The agent runs as headless Claude Code on the pod with Read / Edit
+        / Write / Bash / Glob / Grep tools. It performs disk hygiene on
+        the network volume (prune HF cache for HF-Hub-durable models) and
+        then a code review of the project for blockers to unattended
+        dispatch (hardcoded paths, missing env vars, dep issues). Applies
+        mechanical fixes on a fresh branch; halts and writes a
+        [USER-INPUT-NEEDED] finding for anything only the researcher can
+        decide.
+
+        Hardware: defaults to a **CPU-only RunPod pod** (~$0.05/hr). Prep
+        is shell + LLM + git only — no GPU compute. For a 5-10 min run
+        that's ~$0.01 of compute. To override, pass `compute_type='GPU'`
+        + `gpu=` / `required_vram_gb=`.
 
         Returns `{run_id, status, pod_handle}`. Use `list_findings(run_id)`
-        to read the review when complete. The agent's recommendation lands
-        in the result dict's `blockers_found` field.
+        to read the review when complete.
         """
         if compute is None:
             raise ValueError("compute backend not configured")
@@ -294,6 +321,10 @@ def build_mcp(
             final_params["project_repo_url"] = project_repo_url
         if project_repo_branch is not None:
             final_params["project_repo_branch"] = project_repo_branch
+        # Default to CPU-only pod (~$0.05/hr). Caller can override via
+        # compute_type='GPU' (e.g. if a future prep variant wants to do
+        # GPU-backed import smoke tests); then required_vram_gb/gpu kick in
+        # and the LLM advisor picks from the cheapest sufficient bracket.
         run = dispatcher.dispatch_new(
             workflow="prepare",
             pipeline_name=pipeline_name,
@@ -302,7 +333,13 @@ def build_mcp(
             settings=settings,
             storage=storage,
             compute=compute,
-            required_vram_gb=8,   # prep agent doesn't need GPU, but RunPod requires one — pick smallest
+            compute_type=compute_type,
+            gpu=gpu,
+            required_vram_gb=required_vram_gb if (compute_type == "GPU" and required_vram_gb is None) else required_vram_gb,
+            model_client=model_client,
+            intent=intent or "prep agent: pre-flight code review + disk hygiene; LLM+shell only",
+            prefer="cheapest",
+            fallback_to_default=False,
             project_repo_url=project_repo_url,
             project_repo_token=project_repo_token,
             project_repo_branch=project_repo_branch,
@@ -316,8 +353,14 @@ def build_mcp(
         intent: str | None = None,
         budget_usd: float | None = None,
         parent_run_id: str | None = None,
+        gpu: str | list[str] | None = None,
+        required_vram_gb: int | None = None,
+        compute_type: str = "CPU",
     ) -> dict[str, Any]:
         """Dispatch a MECHANIC Run — one-shot health check on `target_run_id`.
+
+        Hardware: defaults to a **CPU-only pod** (~$0.05/hr). One LLM call,
+        no GPU compute. To override, pass `compute_type='GPU'`.
 
         Returns `{run_id, status, pod_handle}`. Use `list_findings(run_id)`
         to read the recommendation when complete. The agent's recommendation
@@ -337,7 +380,13 @@ def build_mcp(
             settings=settings,
             storage=storage,
             compute=compute,
-            required_vram_gb=8,
+            compute_type=compute_type,
+            gpu=gpu,
+            required_vram_gb=required_vram_gb if (compute_type == "GPU" and required_vram_gb is None) else required_vram_gb,
+            model_client=model_client,
+            intent=intent or "mechanic agent: one-shot health check; single LLM call",
+            prefer="cheapest",
+            fallback_to_default=False,
             parent_run_id=parent_run_id,
         )
         return {"run_id": run.id, "status": run.status.value, "pod_handle": run.pod_handle}
@@ -350,6 +399,9 @@ def build_mcp(
         project_repo_token: str | None = None,
         budget_usd: float | None = None,
         parent_run_id: str | None = None,
+        gpu: str | list[str] | None = None,
+        required_vram_gb: int | None = None,
+        compute_type: str = "CPU",
     ) -> dict[str, Any]:
         """Dispatch a POSTFLIGHT Run — generate + push experiment_summary.md.
 
@@ -358,6 +410,9 @@ def build_mcp(
         report (spend in headline), and commits + pushes it to the user's
         project repo on `autoresearch/results-<target_run_id>`. Best-effort
         — push is skipped if no PROJECT_REPO_TOKEN or no remote.
+
+        Hardware: defaults to a **CPU-only pod** (~$0.05/hr). Pure text +
+        git workload. To override, pass `compute_type='GPU'`.
 
         Returns `{run_id, status, pod_handle}`.
         """
@@ -372,7 +427,13 @@ def build_mcp(
             settings=settings,
             storage=storage,
             compute=compute,
-            required_vram_gb=8,
+            compute_type=compute_type,
+            gpu=gpu,
+            required_vram_gb=required_vram_gb if (compute_type == "GPU" and required_vram_gb is None) else required_vram_gb,
+            model_client=model_client,
+            intent="postflight agent: write experiment_summary.md and git push",
+            prefer="cheapest",
+            fallback_to_default=False,
             project_repo_url=project_repo_url,
             project_repo_token=project_repo_token,
             project_repo_branch=project_repo_branch,

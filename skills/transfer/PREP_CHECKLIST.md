@@ -92,6 +92,17 @@ Iterate on this list as new "should have asked the user" cases bite.
   there aren't any others.)
 - **Ask:** N/A for v0.
 
+## 11. Volume disk usage (advisory)
+
+- **Check:** none locally — the pod runs `disk_preflight` on boot and writes
+  a finding with `df -h /workspace`. You don't need to ask the user about
+  this in advance.
+- **Ask:** N/A. But: if the user reports an earlier run failed with the
+  message `DISK PREFLIGHT FAILED` (or you see one in `list_findings`),
+  tell them the prep agent can prune the HF cache for models already
+  durably stored on HF Hub — it has authority to do that. Re-dispatch
+  prep and it'll clean up before the next transfer attempt.
+
 ---
 
 ## What this checklist intentionally does NOT cover

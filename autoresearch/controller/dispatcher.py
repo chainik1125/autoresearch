@@ -28,7 +28,10 @@ def _resolve_gpu(
     model_client: ModelClient | None = None,
     intent: str | None = None,
     pipeline_name: str = "<unknown>",
+    workflow: str = "transfer",
     estimated_minutes: int = 0,
+    prefer: str = "fastest_least_complicated",
+    fallback_to_default: bool = True,
 ) -> str | list[str]:
     """Pick the GPU spec for a dispatch.
 
@@ -37,7 +40,15 @@ def _resolve_gpu(
       2. Pipeline's `required_vram_gb` → query backend's offers + run
          `core/hardware.py:recommend()` (LLM-advised if `model_client` and
          `intent` are supplied, deterministic otherwise).
-      3. `settings.default_gpu` — last-resort literal.
+      3. `settings.default_gpu` — last-resort literal. Suppressed via
+         `fallback_to_default=False` (used by agent workflows, where the
+         "default" H100 would be a 1000x cost overrun for a 30-second LLM
+         call — better to fail loudly than silently dispatch on a $5/hr GPU).
+
+    `prefer` selects the ranking heuristic. Pipeline runs use
+    "fastest_least_complicated" (the default); agent workflows
+    (prepare/mechanic/postflight) pass "cheapest" since they're LLM/network
+    calls, not GPU compute.
 
     Thin dispatcher-side glue; the actual selection logic lives in
     `core/hardware.py` so heuristics and prompts evolve independently.
@@ -55,12 +66,25 @@ def _resolve_gpu(
             data_center_id=settings.runpod_data_center,
             intent=intent,
             pipeline_name=pipeline_name,
+            workflow=workflow,
             estimated_minutes=estimated_minutes,
             client=model_client,
+            prefer=prefer,  # type: ignore[arg-type]
         )
         if rec.picks:
             return rec.picks
+    if not fallback_to_default:
+        raise ValueError(
+            "GPU resolution failed and fallback_to_default=False — refusing to "
+            "silently dispatch on settings.default_gpu. Catalog query may have "
+            "errored, or no in-stock GPU met required_vram_gb. Pass `gpu=` "
+            "explicitly, or check RunPod inventory."
+        )
     return settings.default_gpu
+
+
+_DEFAULT_AGENT_CPU_FLAVORS = ("cpu3c", "cpu5c")
+_DEFAULT_AGENT_VCPU_COUNT = 4
 
 
 def _build_spec(
@@ -73,10 +97,16 @@ def _build_spec(
     model_client: ModelClient | None = None,
     intent: str | None = None,
     pipeline_name: str = "<unknown>",
+    workflow: str = "transfer",
     estimated_minutes: int = 0,
     project_repo_url: str | None = None,
     project_repo_token: str | None = None,
     project_repo_branch: str | None = None,
+    prefer: str = "fastest_least_complicated",
+    fallback_to_default: bool = True,
+    compute_type: str = "GPU",
+    cpu_flavors: list[str] | None = None,
+    vcpu_count: int | None = None,
 ) -> SessionSpec:
     if not settings.runpod_network_volume_id:
         raise ValueError(
@@ -93,8 +123,26 @@ def _build_spec(
     if repo_url:
         env["PROJECT_REPO_URL"] = repo_url
 
-    # Hardware selection — gpu may be a string, a preference-ordered list, or
-    # auto-resolved from required_vram_gb against the backend's catalog.
+    # CPU pod path — agent workflows (prepare/mechanic/postflight) default
+    # here. RunPod CPU pods are ~$0.05/hr; the cheapest GPU pod is ~$0.17/hr,
+    # and the LLM-only workloads have no use for the GPU at all.
+    if compute_type == "CPU":
+        flavors = list(cpu_flavors) if cpu_flavors else list(_DEFAULT_AGENT_CPU_FLAVORS)
+        return SessionSpec(
+            compute_type="CPU",
+            cpu_flavors=flavors,
+            vcpu_count=vcpu_count or _DEFAULT_AGENT_VCPU_COUNT,
+            gpu=[],
+            image=settings.runpod_default_image,
+            network_volume_id=settings.runpod_network_volume_id,
+            env=env,
+            name=f"autoresearch-{run.id}",
+            container_disk_gb=settings.runpod_container_disk_gb,
+            container_registry_auth_id=settings.runpod_container_registry_auth_id,
+        )
+
+    # GPU pod path — pipeline runs, plus any agent workflow that explicitly
+    # asked for a GPU via compute_type='GPU' override.
     resolved_gpu: str | list[str]
     if compute is not None:
         resolved_gpu = _resolve_gpu(
@@ -105,12 +153,21 @@ def _build_spec(
             model_client=model_client,
             intent=intent,
             pipeline_name=pipeline_name,
+            workflow=workflow,
             estimated_minutes=estimated_minutes,
+            prefer=prefer,
+            fallback_to_default=fallback_to_default,
         )
     else:
+        if gpu is None and not fallback_to_default:
+            raise ValueError(
+                "GPU not specified and fallback_to_default=False (no compute "
+                "backend to query for catalog either). Pass `gpu=` explicitly."
+            )
         resolved_gpu = gpu or settings.default_gpu
 
     return SessionSpec(
+        compute_type="GPU",
         gpu=resolved_gpu,
         image=settings.runpod_default_image,
         network_volume_id=settings.runpod_network_volume_id,
@@ -139,6 +196,11 @@ def dispatch_new(
     project_repo_token: str | None = None,
     project_repo_branch: str | None = None,
     parent_run_id: str | None = None,
+    prefer: str = "fastest_least_complicated",
+    fallback_to_default: bool = True,
+    compute_type: str = "GPU",
+    cpu_flavors: list[str] | None = None,
+    vcpu_count: int | None = None,
 ) -> Run:
     """Create a fresh Run and launch its pod. Returns the persisted Run.
 
@@ -170,10 +232,16 @@ def dispatch_new(
         model_client=model_client,
         intent=intent,
         pipeline_name=pipeline_name,
+        workflow=workflow,
         estimated_minutes=estimated_minutes,
         project_repo_url=project_repo_url,
         project_repo_token=project_repo_token,
         project_repo_branch=project_repo_branch,
+        prefer=prefer,
+        fallback_to_default=fallback_to_default,
+        compute_type=compute_type,
+        cpu_flavors=cpu_flavors,
+        vcpu_count=vcpu_count,
     )
     handle = compute.create_session(spec)
     run.pod_handle = handle.id

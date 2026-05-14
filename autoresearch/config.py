@@ -104,6 +104,13 @@ class Settings(BaseSettings):
     supervisor_poll_seconds: float = 30.0
     supervisor_stale_minutes: int = 5         # heartbeat staleness threshold (short tools)
     supervisor_long_call_stale_hours: int = 2 # threshold when in_long_pipeline_call=true
+    # Boot-stall timeout. A Run that's been QUEUED for this long with no
+    # heartbeat is presumed boot-stalled (image pull failed, entrypoint
+    # crashed before the runner could write its first heartbeat, etc.).
+    # Supervisor terminates its pod and marks the Run FAILED. Set generous
+    # enough to cover a cold-start image pull on GHCR (~3-5 min) + the
+    # pod-side requirements.txt install (~30-60s) plus margin.
+    supervisor_boot_stall_minutes: int = 12
 
     @classmethod
     def load(cls) -> Settings:

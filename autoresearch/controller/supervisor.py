@@ -17,6 +17,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from autoresearch.backends.compute import ComputeBackend
+from autoresearch.backends.models.base import ModelClient
 from autoresearch.backends.storage import StorageBackend
 from autoresearch.config import Settings
 from autoresearch.controller import dispatcher
@@ -36,10 +37,15 @@ class Supervisor:
         settings: Settings,
         storage: StorageBackend,
         compute: ComputeBackend,
+        model_client: ModelClient | None = None,
     ) -> None:
         self.settings = settings
         self.storage = storage
         self.compute = compute
+        # Optional — when present, auto-dispatched postflight runs route
+        # GPU selection through the LLM advisor instead of the deterministic
+        # ranker only.
+        self.model_client = model_client
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
@@ -116,7 +122,9 @@ class Supervisor:
                         settings=self.settings,
                         storage=self.storage,
                         compute=self.compute,
-                        required_vram_gb=8,  # smallest fitting GPU; postflight is mostly text + git
+                        model_client=self.model_client,
+                        intent="auto-dispatched postflight: text + git push, no GPU compute",
+                        compute_type="CPU",                       # ~$0.05/hr; no GPU needed
                         parent_run_id=run.id,
                     )
                     run.params["postflight_run_id"] = pf.id
@@ -143,7 +151,22 @@ class Supervisor:
                 continue
             beat = heartbeat.load(self.storage, run)
             if beat is None:
-                continue  # no heartbeat yet — let the new pod write its first one
+                # No heartbeat ever written. Two cases:
+                #   (a) Pod is still booting — that's fine, let it finish.
+                #   (b) Pod is wedged (broken image, crashing entrypoint, etc.) —
+                #       it'll sit at $X/hr forever unless we time it out.
+                # Distinguish by age: a Run that's been QUEUED with no heartbeat
+                # for longer than `supervisor_boot_stall_minutes` is presumed
+                # wedged. Reap it.
+                boot_stall = timedelta(minutes=self.settings.supervisor_boot_stall_minutes)
+                age = now - run.created_at
+                if run.status == RunStatus.QUEUED and age > boot_stall:
+                    _log.warning(
+                        "run %s boot-stalled (no heartbeat after %s); failing + terminating pod %s",
+                        run.id, age, run.pod_handle,
+                    )
+                    self._fail_boot_stalled_run(run, age)
+                continue
             threshold = long_stale if beat.in_long_pipeline_call else short_stale
             if now - beat.timestamp <= threshold:
                 continue
@@ -159,3 +182,82 @@ class Supervisor:
             except Exception:  # noqa: BLE001 -- log and continue
                 _log.exception("failed to redispatch run %s", run.id)
         return restarted
+
+    def _fail_boot_stalled_run(self, run: Run, age: timedelta) -> None:
+        """Terminate a boot-stalled pod, fetch its container logs as a finding,
+        and mark the Run FAILED. Best-effort throughout — supervisor must
+        never crash, so each step is wrapped.
+
+        This is the only path that fails a Run from outside the runner. The
+        rationale: if the runner can't even write its first heartbeat, the
+        container never reached our code, so there's no other actor that can
+        record the failure.
+        """
+        from autoresearch.core import findings as findings_mod
+        from autoresearch.core.findings import FindingType
+
+        log_tail: str | None = None
+        pod_runpod_status: str | None = None
+        pod_image: str | None = None
+        if run.pod_handle:
+            try:
+                handle = self.compute.get_session(run.pod_handle)
+                pod_runpod_status = handle.status
+                # raw.imageName is the RunPod payload — pull it through if present
+                pod_image = (handle.raw or {}).get("imageName")
+            except Exception:  # noqa: BLE001
+                _log.exception("could not query RunPod status for %s", run.pod_handle)
+            try:
+                log_tail = self._fetch_pod_logs(run.pod_handle)
+            except Exception:  # noqa: BLE001
+                _log.exception("could not fetch boot-stall logs for pod %s", run.pod_handle)
+            try:
+                self.compute.terminate_session(run.pod_handle)
+            except Exception:  # noqa: BLE001
+                _log.exception("could not terminate boot-stalled pod %s", run.pod_handle)
+
+        try:
+            lines = [
+                f"BOOT-STALLED: Run sat QUEUED for {age} with no heartbeat.",
+                f"Pod handle: {run.pod_handle!r}",
+                f"Pod status on RunPod: {pod_runpod_status or 'unknown'}",
+                f"Image: {pod_image or '(unknown — could not query)'}",
+                "",
+                "Likely causes (RunPod doesn't expose container logs over their API, so we can't be more specific):",
+                "  - Image pull failed (registry auth, missing tag, broken digest)",
+                "  - Entrypoint crashed before the runner could write its first heartbeat",
+                "  - Network volume mount failed",
+                "",
+                "Diagnostics to try:",
+                f"  - Verify image is pullable: `docker pull {pod_image or '<image>'}`",
+                "  - Check GHCR/ECR/etc. shows the tag",
+                "  - Spawn a debug pod with the same image and SSH in manually",
+                "  - Inspect entrypoint.sh — most likely culprit on auth or volume setup",
+            ]
+            if log_tail:
+                lines += ["", "Container logs (tail):", "```", log_tail, "```"]
+            findings_mod.append(self.storage, run, FindingType.ERROR, "\n".join(lines))
+        except Exception:  # noqa: BLE001
+            _log.exception("could not write boot-stall finding for %s", run.id)
+
+        try:
+            fresh = Run.load(self.storage, run.id)
+            fresh.status = RunStatus.FAILED
+            fresh.last_error = f"pod boot-stalled (no heartbeat after {age})"
+            fresh.save(self.storage)
+        except Exception:  # noqa: BLE001
+            _log.exception("could not mark %s FAILED after boot-stall", run.id)
+
+    def _fetch_pod_logs(self, pod_id: str) -> str | None:
+        """Optional hook to grab container logs from the compute backend.
+        Returns the tail of the container's stdout/stderr as a string, or
+        None if the backend doesn't expose log retrieval.
+        """
+        get_logs = getattr(self.compute, "get_session_logs", None)
+        if get_logs is None:
+            return None
+        try:
+            return get_logs(pod_id, max_chars=8000)
+        except Exception:  # noqa: BLE001
+            _log.exception("get_session_logs failed for %s", pod_id)
+            return None

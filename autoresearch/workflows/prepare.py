@@ -47,6 +47,42 @@ check-in.
 
 YOUR DEFAULT IS "no edits, ready to dispatch." Most projects are fine.
 
+### Step 0 — disk hygiene on the network volume (DO THIS FIRST)
+
+The pod's persistent volume is mounted at `/workspace`. Before anything
+else, run `Bash: df -h /workspace` and check free space.
+
+  - **≥50G free**: skip cleanup, move on to code review.
+  - **<50G free**: prune before any other work, in this order:
+      1. `du -sh /workspace/* 2>/dev/null | sort -h | tail -20` to find
+         the biggest dirs.
+      2. **HF cache** at `/workspace/.huggingface/hub/`. Each model lives
+         at `models--<org>--<name>/`. Models pulled from HF Hub are
+         durably stored upstream — local copies are pure cache. SAFE TO
+         DELETE any model dir whose source repo on HF Hub is public and
+         non-gated.
+         Verify before deleting: `Bash: curl -sI https://huggingface.co/<org>/<name>`
+         should return 200. If it 404s or 401s (gated / private),
+         DO NOT delete — re-downloading may not be possible.
+      3. **Old training outputs** at e.g. `/workspace/saes/`, `/workspace/outputs/`,
+         `/workspace/runs/`. If you find a `*.uploaded` or
+         `.hf_uploaded` marker, or the directory contains a `final/`
+         step that matches a HF Hub repo name in any code you can grep
+         (`Grep` for the dir basename across `pipelines/`), it's safe to
+         delete. Otherwise leave it alone and note it as a finding —
+         the user has to decide.
+      4. **Pip cache** at `/workspace/.cache/pip/` is always safe to
+         delete; it just slows the next install by 30-60s.
+  - Print one line per deletion: `DELETED: /workspace/.huggingface/hub/models--X ( saved 12G )`.
+  - End the cleanup phase with `Bash: df -h /workspace` again so the
+    after-state is in the log.
+
+If the floor in `disk_preflight.py` (currently 25G) trips AFTER your
+cleanup, that's a hard failure — print `[USER-INPUT-NEEDED] disk floor
+breached after cleanup; volume needs resize`.
+
+### Step 1 — code review (the main job)
+
 If you find a problem, categorize it:
 
   **MECHANICAL** — you can fix it yourself, right now, by editing files in
@@ -78,12 +114,18 @@ If you find a problem, categorize it:
   fixes confuse the audit trail. Resolution: researcher resolves blocker,
   re-dispatches, prep applies the mechanical fixes on the next pass.)
 
+  Volume cleanup from Step 0 is independent — even if Step 1 surfaces a
+  USER-INPUT-NEEDED blocker, the deletions you already made stay made.
+  Note them in your reply so the audit trail is intact.
+
 OUTPUT FORMAT:
 
   - If no edits needed: end with one line `OK: ready to dispatch` and one
-    short sentence on what you confirmed.
+    short sentence on what you confirmed. Include the freed-space delta
+    if you cleaned anything.
   - If you applied mechanical edits: end with one line summary
-    `EDITED: <N> files` and a one-line per-file changelog.
+    `EDITED: <N> files` and a one-line per-file changelog. Include the
+    freed-space delta if you cleaned anything.
   - If user-input-needed: end with one or more
     `[USER-INPUT-NEEDED] <one-line description>` lines and nothing else.
 

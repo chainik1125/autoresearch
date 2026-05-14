@@ -196,20 +196,39 @@ def select_gpu_offers(
 #     trade off speed vs cost.
 _ADVISOR_PROMPT = """You are picking GPU hardware for a research run on RunPod.
 
-Hard constraints:
+Hard constraints (NEVER violate these — picks that do will be dropped):
 - The run requires AT LEAST {required_vram_gb} GB of VRAM. Anything smaller will OOM.
-- The volume is bound to data-center {data_center_id!r}. Offers outside that DC are not usable.
+- The volume is bound to data-center {data_center_id!r}. Offers marked "OUT OF
+  STOCK in this DC" cannot be allocated — picking them means the dispatch fails
+  with a 422 and the user pays for nothing. Only pick from offers marked "in stock".
+- If you think an out-of-stock SKU would be ideal, mention it in `rationale`
+  ("B200 would be best but is OOS in US-CA-2") and pick the next-best in-stock
+  one.
 
-Default heuristic: "fastest, least complicated."
-  - Prefer the smallest VRAM bucket that has headroom (>= 1.2x the requirement). Don't
-    pay for a 180GB GPU when a 48GB one works.
-  - Within that bucket, prefer the newer / faster card (higher price typically maps to
-    newer generation: Blackwell > Hopper > Lovelace > Ampere).
-  - For well-tested pipelines, prefer GPUs the project has used before (typically H100
-    or B200 — those have been validated end-to-end).
+The deterministic ranker has pre-filtered offers by VRAM floor + stock and
+ordered them according to the operator's stated preference (`prefer` below).
+Your job is to apply judgment on top: the ranker can't see context that
+matters (workflow type, prior failures, inventory pressure, weird quirks
+like "this SKU OOMs on Qwen-32B because of optimizer state"). When in
+doubt, the ranker's ordering is a sensible default.
+
+Operator's stated preference (`prefer`): {prefer}
+  - "fastest_least_complicated" (default for compute pipelines): smallest
+    VRAM bucket with 1.2x headroom, newest gen within bucket. Don't pay
+    for a 180GB GPU when a 48GB one works.
+  - "cheapest" (default for agent workflows — prepare/mechanic/postflight):
+    pure LLM/network/shell workloads, no GPU compute. Pick the absolute
+    cheapest sufficient SKU. A 16GB A4000 at $0.17/hr is fine for a 10-min
+    text-and-git run; an H100 at $2.69/hr is a 15x overspend.
+  - "biggest_memory_first" / "fastest_first": override knobs for unusual
+    cases — honor them unless they conflict with a hard constraint.
+
+For well-tested pipelines, prefer GPUs the project has used before
+(typically H100 / B200 for compute, A4000 / A5000 / L4 for agents).
 
 Run context:
 - Pipeline name: {pipeline_name}
+- Workflow: {workflow}
 - Estimated duration on a typical GPU: {estimated_minutes} minutes
 - Operator intent: {intent}
 
@@ -224,12 +243,16 @@ Return ONLY this JSON shape (no prose, no code fences):
   "alternatives": ["<gpuTypeId>", ...]
 }}
 
-Confidence rules:
-- "high" — your top pick is a clear best-fit AND its hourly rate is reasonable
-  (< $3/hr) AND there are at least 2 in-stock options as fallbacks.
-- "needs_review" — borderline VRAM, expensive top pick (>= $3/hr), thin
-  inventory, or the operator intent is too vague to trade off speed vs cost.
-  Put the trade-off in `rationale` so the user can answer in conversation.
+Confidence rules (scale with `prefer`):
+- For "cheapest" agent workflows: "high" when the top pick is a clear
+  cheapest-sufficient option AND there are 2+ in-stock fallbacks. The
+  $3/hr review threshold doesn't apply — agent workflows should be in
+  the $0.10-0.50/hr range; flag review if the cheapest sufficient option
+  is > $1/hr (something's odd).
+- For compute workflows: "high" when top pick is best-fit AND < $3/hr
+  AND 2+ fallbacks; otherwise "needs_review".
+- Always "needs_review" when intent is too vague to trade off cost vs.
+  speed, or inventory is thin (< 2 picks).
 
 `picks` should have 3-5 entries when possible (RunPod uses them as a fallback ladder).
 `alternatives` are only relevant for needs_review; include 1-2 plausible different
@@ -268,18 +291,23 @@ def _deterministic_recommendation(
     required_vram_gb: int,
     data_center_id: str | None,
     max_candidates: int,
+    prefer: Heuristic = "fastest_least_complicated",
 ) -> HardwareRecommendation:
     """Produce a HardwareRecommendation without any LLM. The fallback path.
 
     The confidence rule here is conservative: high only if the top pick is
     < $3/hr AND has 1.2x VRAM headroom AND at least 2 picks total. Anything
     looser is "needs_review" so a human gets a chance to confirm.
+
+    `prefer` controls the ranker; defaults to fastest-least-complicated for
+    pipeline runs. Agent workflows (prepare/mechanic/postflight) should pass
+    `prefer="cheapest"` since they're LLM/network calls, not GPU compute.
     """
     picks = select_gpu_offers(
         offers,
         required_vram_gb=required_vram_gb,
         data_center_id=data_center_id,
-        prefer="fastest_least_complicated",
+        prefer=prefer,
         max_candidates=max_candidates,
     )
     if not picks:
@@ -324,9 +352,11 @@ def recommend(
     data_center_id: str | None = None,
     intent: str | None = None,
     pipeline_name: str = "<unknown>",
+    workflow: str = "transfer",
     estimated_minutes: int = 0,
     client: "ModelClient | None" = None,
     max_candidates: int = 5,
+    prefer: Heuristic = "fastest_least_complicated",
 ) -> HardwareRecommendation:
     """Top-level: produce a HardwareRecommendation.
 
@@ -347,10 +377,18 @@ def recommend(
         required_vram_gb=required_vram_gb,
         data_center_id=data_center_id,
         max_candidates=max_candidates,
+        prefer=prefer,
     )
 
     if client is None or intent is None or not deterministic.picks:
         return deterministic
+    # NOTE: we deliberately do NOT short-circuit the advisor when prefer is
+    # "cheapest". The deterministic ranker produces the candidate ordering,
+    # but Claude makes the final pick with the operator's intent + context
+    # (workflow type, recent failures, inventory pressure). Even for cheap
+    # agent workflows, that judgment layer adds value — e.g. recognizing
+    # "this SKU OOM'd on the last three preps because of an unexpected dep,
+    # try the next-cheapest with more headroom."
 
     try:
         prompt = _ADVISOR_PROMPT.format(
@@ -358,8 +396,10 @@ def recommend(
             data_center_id=data_center_id or "any",
             max_candidates=max_candidates,
             pipeline_name=pipeline_name,
+            workflow=workflow,
             estimated_minutes=estimated_minutes,
             intent=intent,
+            prefer=prefer,
             offers_table=_format_offers_for_prompt(offers),
         )
         resp = client.complete(
@@ -370,7 +410,18 @@ def recommend(
         parsed = _parse_json_lenient(resp.text)
         if not isinstance(parsed, dict):
             raise ValueError("advisor response is not a JSON object")
-        valid_ids = {o.id for o in offers if o.memory_gb >= required_vram_gb}
+        # Validate picks against the VRAM floor AND the DC stock filter. The
+        # advisor is shown out-of-stock SKUs in the offers table (so it can
+        # rationalize "B200 would be ideal but it's not in this DC"), but
+        # those picks MUST NOT survive validation — otherwise we dispatch
+        # against a SKU the backend can't allocate, the pod creation 422s,
+        # and the user pays for the failed attempt.
+        valid_ids = {
+            o.id for o in offers
+            if o.memory_gb >= required_vram_gb
+            and (data_center_id is None or o.available_in_dc)
+            and o.price_per_hour is not None
+        }
         picks = [p for p in parsed.get("picks", []) if isinstance(p, str) and p in valid_ids][:max_candidates]
         if not picks:
             raise ValueError("advisor returned no valid picks")

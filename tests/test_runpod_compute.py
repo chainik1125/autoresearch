@@ -124,6 +124,53 @@ def test_create_session_passes_extra_ports_and_disables_ssh() -> None:
     assert body["ports"] == ["8000/http"]
 
 
+def test_create_session_cpu_pod_wire_shape() -> None:
+    """CPU pods must POST computeType='CPU' + cpuFlavorIds + vcpuCount, and
+    must NOT include any gpuTypeIds/gpuCount fields. Matches RunPod's REST
+    schema for /v1/pods CPU pods."""
+    captured: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        import json as _json
+        captured["body"] = _json.loads(req.content)
+        return httpx.Response(201, json={"id": "pod-cpu", "desiredStatus": "QUEUED"})
+
+    compute = _mock_compute(handler)
+    spec = SessionSpec(
+        compute_type="CPU",
+        cpu_flavors=["cpu3c", "cpu5c"],
+        vcpu_count=4,
+        image="ubuntu:22.04",
+        network_volume_id="vol-xyz",
+        env={"RUN_ID": "prep-1"},
+        name="autoresearch-prep-1",
+    )
+    compute.create_session(spec)
+    body = captured["body"]
+    assert body["computeType"] == "CPU"
+    assert body["cpuFlavorIds"] == ["cpu3c", "cpu5c"]
+    assert body["vcpuCount"] == 4
+    assert "gpuTypeIds" not in body  # no GPU fields on a CPU pod
+    assert "gpuCount" not in body
+    assert body["imageName"] == "ubuntu:22.04"
+    assert body["networkVolumeId"] == "vol-xyz"
+
+
+def test_create_session_cpu_pod_requires_flavors() -> None:
+    """A CPU pod with no cpu_flavors is a misconfig — fail loudly rather
+    than POST an invalid body to RunPod."""
+    compute = _mock_compute(lambda req: httpx.Response(201, json={}))
+    spec = SessionSpec(
+        compute_type="CPU",
+        cpu_flavors=[],
+        image="x",
+        network_volume_id="v",
+    )
+    import pytest
+    with pytest.raises(ValueError, match="cpu_flavors"):
+        compute.create_session(spec)
+
+
 def test_create_session_includes_registry_auth_when_set() -> None:
     captured: dict = {}
 

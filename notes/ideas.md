@@ -102,6 +102,79 @@ Note! You will want some meta-optimization agents going: I.e. you may want a pre
   fragile and arguably outside intended use. Track Anthropic's roadmap
   here.
 
+### Prior-failures-as-context for the hardware advisor
+
+The LLM advisor currently sees `offers`, `intent`, `pipeline_name`, and
+`workflow` — but **not** which SKUs have failed before for this pipeline.
+That context would unlock judgment calls like "A4000 OOM'd on the last
+two preps with sae_lens deps; bump to A5000 even though it's $0.09/hr
+more." Today the advisor can apply that reasoning only if the caller
+hand-encodes it into `intent`.
+
+The minimal wiring: in dispatcher's `_resolve_gpu`, query the last N
+FAILED runs with the same `workflow + pipeline_name` and pass their
+`pod_handle`-derived SKU + `last_error` snippet as a new `prior_failures`
+field on the advisor prompt. Add a small index on R2 so the lookup is
+O(1) — today it'd be a full prefix scan of `runs/`.
+
+Why v2 not v1: the advisor handles intent strings well enough that
+manually adding "don't pick A4000, it OOM'd last time" to the intent
+covers it for now. Pull this forward when the same SKU bites us twice
+in a row in the wild.
+
+### CPU-only pods for agent workflows ✅ landed (2026-05-13)
+
+Prep / mechanic / postflight now default to CPU-only RunPod pods
+(~$0.05/hr). RunPod's REST `/v1/pods` accepts `computeType: "CPU"` +
+`cpuFlavorIds`. The original assumption that "RunPod requires a GPU" was
+wrong; documenting here so we don't lose track of why agent pods are
+cheap. Caller can opt back into GPU with `compute_type="GPU"` for special
+cases (e.g. a future prep variant that does import-smoke-tests on real
+hardware).
+
+RunPod supports CPU pods through a separate API path (`/v1/cpu-pods` or
+similar gRPC). Wiring it in:
+
+- `backends/compute/runpod.py`: add `create_cpu_session(spec)` that hits
+  the CPU endpoint; switch which one based on `spec.gpu is None`.
+- `SessionSpec.gpu: str | list[str] | None`. None ⇒ CPU pod.
+- `mcp_surface.py`: pass `gpu=None` for prepare/mechanic/postflight; the
+  `prefer="cheapest"` selector becomes a fallback for when caller passes
+  required_vram_gb.
+
+Tracked here because v1 took the pragmatic route (cheapest GPU, never
+fall through to default_gpu) after a real incident: prep landed on H200
+SXM ($5.49/hr) for a 30-second LLM call — ~5000x cost overrun, root cause
+in dispatcher.py's fallback path. Fixed (2026-05-13) by adding
+`fallback_to_default=False` for agent workflows. CPU pods are the next
+mile of savings.
+
+### Storage cost — RunPod network volume is the priciest piece
+
+RunPod network volumes are ~$0.07/GB·month. We sized the catch-all
+volume at 1TB (~$70/mo) on 2026-05-13 because debugging ENOSPC mid-run
+was eating more time than the storage is worth. For v1 that's fine.
+
+For v2, the genuinely cheaper architecture is **R2 (cold) + ephemeral
+container disk (warm)**:
+
+- Weights live in Cloudflare R2 (~$0.015/GB·mo, free egress).
+- `entrypoint.sh` pre-stages the model for this Run from R2 to the pod's
+  ephemeral container disk on boot.
+- HF cache on the persistent volume becomes optional — only used if
+  the user explicitly wants it for repeated runs of the same model.
+- Trade-off: 5-10 min cold-boot per model vs. ~$50/mo storage savings
+  at 1TB scale. Pays back fast if the iteration loop is "long-running
+  pods, infrequent boots."
+
+Honest comparison (researched 2026-05-13): cheap object-storage rates
+(GCS ~$0.020/GB·mo, R2 ~$0.015/GB·mo) **do not** translate to cheap
+mountable filesystems. PD-SSD on GCP is $0.17/GB·mo, Filestore
+$0.20-0.30. The only way to beat RunPod here is the hybrid pattern
+above — accept the cold-boot latency in exchange for object-storage
+pricing. Not worth the architectural work for v1; revisit when (a) the
+catch-all volume crosses 2TB or (b) we routinely cache 5+ huge models.
+
 ### Budget accounting
 
 - **Hardware-advisor spend** isn't currently added to
@@ -122,14 +195,10 @@ Note! You will want some meta-optimization agents going: I.e. you may want a pre
   user's actual intent: "spend at most $30 across everything spawned
   by this /transfer."
 
-
-
 ## Wishlist
 
 1. 'Debug cycles' in the pre-launch phase. In general, it would be good to have a number of debug cycles (potentially with another model!) before you launch the experiment.
 
-2. Data-tracking. 
+2. Data-tracking.
 
 Would be really cool to track the data of how often different model choices did best. For example, for the debug cycles, you could imagine at the most basic level having a model injection to look over the code and give you a response (probably CC implements although that model could implement itself if I understand how that works - i.e. call Codex to do it vs. CC and see who does better).
-
-

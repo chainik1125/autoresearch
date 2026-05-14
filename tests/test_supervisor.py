@@ -118,6 +118,65 @@ def test_skips_run_without_heartbeat_yet(tmp_path: Path) -> None:
     assert sup.tick() == []
 
 
+def test_boot_stalled_run_is_failed_and_pod_terminated(tmp_path: Path) -> None:
+    """Regression: a Run that's been QUEUED for longer than
+    `supervisor_boot_stall_minutes` with no heartbeat is presumed boot-stalled
+    (broken image, crashed entrypoint, failed volume mount). Supervisor must:
+      - terminate the pod (so we stop burning $X/hr on a wedged pod),
+      - mark the Run FAILED with last_error explaining the stall,
+      - write a BOOT-STALLED ERROR finding for diagnostics.
+
+    Backstory: a prior dispatch wedged at uptimeSeconds=0 and burned ~$15 over
+    5 hours because the supervisor's "no heartbeat" branch was an
+    unconditional skip.
+    """
+    from autoresearch.core import findings as findings_mod
+
+    settings = _settings(supervisor_boot_stall_minutes=10)
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    run = dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+    )
+    # No heartbeat. Backdate created_at to look 15min old.
+    run.created_at = datetime.now(UTC) - timedelta(minutes=15)
+    run.save(storage)
+
+    sup = Supervisor(settings=settings, storage=storage, compute=compute)
+    sup.tick()
+
+    fresh = Run.load(storage, run.id)
+    assert fresh.status == RunStatus.FAILED
+    assert "boot-stalled" in (fresh.last_error or "").lower()
+    assert run.pod_handle in compute.terminated  # pod actually got reaped
+    finding_bodies = [f.body for f in findings_mod.list_findings(storage, fresh)]
+    assert any("BOOT-STALLED" in b for b in finding_bodies)
+
+
+def test_recent_queued_run_with_no_heartbeat_is_left_alone(tmp_path: Path) -> None:
+    """The boot-stall reaper must NOT fire on a Run that's still within the
+    grace window — that's a normal boot, the pod just hasn't written its
+    first heartbeat yet."""
+    settings = _settings(supervisor_boot_stall_minutes=10)
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    run = dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+    )
+    # 2 minutes old — well within the 10-minute grace window.
+    run.created_at = datetime.now(UTC) - timedelta(minutes=2)
+    run.save(storage)
+
+    sup = Supervisor(settings=settings, storage=storage, compute=compute)
+    sup.tick()
+
+    fresh = Run.load(storage, run.id)
+    assert fresh.status == RunStatus.QUEUED  # untouched
+    assert run.pod_handle not in compute.terminated
+
+
 @pytest.mark.asyncio
 async def test_start_stop_lifecycle(tmp_path: Path) -> None:
     """The async supervisor loop starts and stops cleanly without restart events."""

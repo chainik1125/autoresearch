@@ -73,20 +73,9 @@ class RunPodCompute:
         if spec.expose_ssh and not any(p.startswith("22/") for p in ports):
             ports.append("22/tcp")
 
-        # RunPod's `gpuTypeIds` accepts a list and picks any one with stock.
-        # `spec.gpu` may be a single name or a preference-ordered list (see
-        # core/hardware.py for the producer).
-        gpu_ids: list[str]
-        if isinstance(spec.gpu, str):
-            gpu_ids = [_resolve_gpu(spec.gpu)]
-        else:
-            gpu_ids = [_resolve_gpu(g) for g in spec.gpu]
-
         body: dict[str, Any] = {
             "name": spec.name or "autoresearch-pod",
             "imageName": spec.image,
-            "gpuTypeIds": gpu_ids,
-            "gpuCount": 1,
             "networkVolumeId": spec.network_volume_id,
             "containerDiskInGb": spec.container_disk_gb,
             "env": dict(spec.env),
@@ -94,6 +83,30 @@ class RunPodCompute:
             "interruptible": spec.spot,
             "containerRegistryAuthId": spec.container_registry_auth_id,
         }
+
+        if spec.compute_type == "CPU":
+            # CPU pods: cpuFlavorIds + vCPU count, no GPU fields.
+            # ~$0.05/hr for cpu3c/cpu5c — used for agent workflows (prep, mechanic, postflight).
+            if not spec.cpu_flavors:
+                raise ValueError("compute_type='CPU' requires cpu_flavors (e.g. ['cpu3c', 'cpu5c'])")
+            body["computeType"] = "CPU"
+            body["cpuFlavorIds"] = list(spec.cpu_flavors)
+            body["vcpuCount"] = spec.vcpu_count
+        else:
+            # GPU pods: gpuTypeIds + gpuCount.
+            # `spec.gpu` may be a single name or a preference-ordered list (see
+            # core/hardware.py for the producer); RunPod picks any one with stock.
+            gpu_ids: list[str]
+            if isinstance(spec.gpu, str):
+                gpu_ids = [_resolve_gpu(spec.gpu)]
+            else:
+                gpu_ids = [_resolve_gpu(g) for g in spec.gpu]
+            if not gpu_ids:
+                raise ValueError("compute_type='GPU' (default) requires `gpu` to be set")
+            body["computeType"] = "GPU"
+            body["gpuTypeIds"] = gpu_ids
+            body["gpuCount"] = 1
+
         body = {k: v for k, v in body.items() if v is not None}
 
         r = self._client.post("/pods", json=body)

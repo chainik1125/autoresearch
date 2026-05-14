@@ -42,6 +42,23 @@ fi
 WORKSPACE="${WORKSPACE_DIR:-/workspace}"
 mkdir -p "${WORKSPACE}/.huggingface" "${WORKSPACE}/.cache/pip"
 
+# Disk preflight. Writes a finding with df output, and hard-aborts before any
+# heavy work if free space is below the floor. Tuned for "model weights +
+# training outputs fit comfortably"; the prep agent can prune the HF cache if
+# this trips. Override with AUTORESEARCH_MIN_FREE_GB=<n> (default 25).
+export AUTORESEARCH_MIN_FREE_GB="${AUTORESEARCH_MIN_FREE_GB:-25}"
+export AUTORESEARCH_DISK_PREFLIGHT_PATH="${WORKSPACE}"
+if [[ -n "${RUN_ID:-}" ]]; then
+    set +e
+    python3 -m autoresearch.disk_preflight
+    DISK_RC=$?
+    set -e
+    if [[ $DISK_RC -ne 0 ]]; then
+        echo "[entrypoint] FATAL: disk preflight failed (rc=$DISK_RC); aborting before heavy work" >&2
+        exit 3
+    fi
+fi
+
 # Default HF env if the dispatcher didn't already inject them.
 export HF_HOME="${HF_HOME:-${WORKSPACE}/.huggingface}"
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
