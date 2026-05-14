@@ -317,6 +317,64 @@ def test_agent_workflow_picks_cheapest_not_default_gpu(tmp_path: Path) -> None:
     assert "NVIDIA H100 80GB HBM3" in picked  # still available as final fallback
 
 
+def test_cpu_pod_container_disk_clamped_to_40(tmp_path: Path) -> None:
+    """Regression: RunPod's CPU pods cap `containerDiskInGb` at 40. Our
+    GPU-tuned default is 50; the dispatcher must clamp on the CPU path or
+    RunPod returns 500 'Container Disk must be less than or equal to 40'.
+
+    Backstory: verified against RunPod's REST API on 2026-05-13 — the first
+    CPU pod rollout 500'd on this exact error before the clamp was added.
+    """
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings(runpod_container_disk_gb=50)  # the GPU-tuned default
+
+    dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        compute_type="CPU",
+    )
+    spec = compute.created[0]
+    assert spec.compute_type == "CPU"
+    assert spec.container_disk_gb == 40, (
+        f"CPU pod disk must be clamped to 40, got {spec.container_disk_gb}"
+    )
+
+
+def test_dispatched_hardware_recorded_in_params(tmp_path: Path) -> None:
+    """Regression: a dispatched Run's params must record what hardware was
+    actually requested (compute_type, image, cpu_flavors OR gpu). Otherwise
+    `get_run` can't tell whether `compute_type="CPU"` was honored or silently
+    dropped — exactly the auditability gap the local Claude hit."""
+    storage = LocalStorage(tmp_path / "store")
+    compute = FakeCompute()
+    settings = _settings()
+
+    # CPU dispatch
+    cpu_run = dispatcher.dispatch_new(
+        workflow="prepare", pipeline_name="x", params={"user_key": "user_value"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        compute_type="CPU",
+    )
+    hw = cpu_run.params["_dispatched_hardware"]
+    assert hw["compute_type"] == "CPU"
+    assert hw["cpu_flavors"] == ["cpu3c", "cpu3g", "cpu5c", "cpu5g"]
+    assert hw["vcpu_count"] == 4
+    assert "gpu" not in hw   # no GPU fields on a CPU dispatch
+    # User-supplied params must be preserved alongside the audit field.
+    assert cpu_run.params["user_key"] == "user_value"
+
+    # GPU dispatch
+    gpu_run = dispatcher.dispatch_new(
+        workflow="transfer", pipeline_name="x", params={"target_model": "Q"},
+        budget_usd=10, settings=settings, storage=storage, compute=compute,
+        gpu="H100 80GB",
+    )
+    hw = gpu_run.params["_dispatched_hardware"]
+    assert hw["compute_type"] == "GPU"
+    assert hw["gpu"] == ["H100 80GB"]
+
+
 def test_agent_workflow_dispatches_cpu_pod_by_default(tmp_path: Path) -> None:
     """Regression: when compute_type='CPU', the SessionSpec must have CPU
     fields populated and the GPU path must be skipped entirely.
@@ -337,7 +395,9 @@ def test_agent_workflow_dispatches_cpu_pod_by_default(tmp_path: Path) -> None:
     )
     spec = compute.created[0]
     assert spec.compute_type == "CPU"
-    assert spec.cpu_flavors == ["cpu3c", "cpu5c"]  # the defaults
+    # Defaults are cheapest-first with multiple fallbacks (verified against
+    # US-CA-2 stock 2026-05-13). RunPod picks any in-stock entry.
+    assert spec.cpu_flavors == ["cpu3c", "cpu3g", "cpu5c", "cpu5g"]
     assert spec.vcpu_count == 4
     assert spec.gpu == []  # explicitly empty
 

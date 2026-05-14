@@ -102,6 +102,39 @@ Note! You will want some meta-optimization agents going: I.e. you may want a pre
   fragile and arguably outside intended use. Track Anthropic's roadmap
   here.
 
+### List CPU offers dynamically (instead of hardcoding flavor list)
+
+Today the dispatcher uses a hardcoded preference order `["cpu3c", "cpu3g",
+"cpu5c", "cpu5g"]`. RunPod picks the first one with stock. Verified
+2026-05-13 against US-CA-2: cpu3c + cpu3g had stock, cpu5c + cpu5g did
+not. This will go stale as RunPod adds/removes flavors. v2: add
+`compute.list_cpu_offers(data_center_id)` analogous to `list_gpu_offers`,
+then thread it through `recommend_hardware` so the LLM advisor sees the
+real available CPU catalog (currently the advisor only handles GPU).
+
+### Pipeline-side footguns surfaced by /transfer attempts
+
+Captured from the local Claude during a smoke test (2026-05-13):
+
+- **`d_in` defaults to 5120 for sae_lens path** (`pipelines/sae_training.py:193`),
+  which is the Qwen-14B/32B hidden size. Trying the same pipeline on
+  Qwen-7B requires overriding to 3584 manually. Should auto-derive
+  `d_in` from `target_model` via the model's HF config — `AutoConfig
+  .from_pretrained(target_model).hidden_size` returns the right value.
+- **`arditi` backend hardcodes `hook_resid_post`** (`pipelines/sae_training.py:265`).
+  Arditi's underlying `run_from_config.py` is fully hookpoint-parameterizable
+  — they trained at multiple layers and hookpoints in the paper. Our
+  wrapper picks `f"blocks.{layer}.hook_resid_post"` purely for ergonomic
+  reasons. Loosening it to accept any hook_name (defaulting to resid_post)
+  is ~5 lines and gives Arditi-recipe SAEs at non-resid_post hookpoints.
+- **Phase-0 of /transfer skill doesn't catch recipe mismatches.** When a
+  user asks for "ln1 and resid_post SAEs at L15 in the Arditi recipe",
+  the skill should notice that arditi backend only does resid_post and
+  ask the user whether to (a) extend the wrapper or (b) accept that ln1
+  will be a different recipe (sae_lens defaults). Today the skill
+  silently dispatches both, producing non-comparable SAEs. Worth a
+  Phase-0 intent-discovery rule.
+
 ### Prior-failures-as-context for the hardware advisor
 
 The LLM advisor currently sees `offers`, `intent`, `pipeline_name`, and

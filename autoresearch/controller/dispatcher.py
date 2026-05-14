@@ -83,8 +83,17 @@ def _resolve_gpu(
     return settings.default_gpu
 
 
-_DEFAULT_AGENT_CPU_FLAVORS = ("cpu3c", "cpu5c")
+# Preference-ordered CPU flavor IDs for RunPod CPU pods. Cheapest first so
+# the catalog picks a 3c at $0.06/hr when available, falling through to 5-gen
+# variants when 3-gen is depleted. Verified 2026-05-13 against US-CA-2: cpu3c
+# + cpu3g have stock, cpu5c + cpu5g are valid IDs but currently out of stock.
+# Multiple entries because RunPod's API picks any one with inventory.
+_DEFAULT_AGENT_CPU_FLAVORS = ("cpu3c", "cpu3g", "cpu5c", "cpu5g")
 _DEFAULT_AGENT_VCPU_COUNT = 4
+
+# RunPod's CPU pods cap containerDiskInGb at 40 (validated against the API).
+# Our GPU-tuned default is 50; for CPU dispatches we must clamp.
+_CPU_POD_MAX_CONTAINER_DISK_GB = 40
 
 
 def _build_spec(
@@ -124,10 +133,14 @@ def _build_spec(
         env["PROJECT_REPO_URL"] = repo_url
 
     # CPU pod path — agent workflows (prepare/mechanic/postflight) default
-    # here. RunPod CPU pods are ~$0.05/hr; the cheapest GPU pod is ~$0.17/hr,
+    # here. RunPod CPU pods are ~$0.06/hr; the cheapest GPU pod is ~$0.17/hr,
     # and the LLM-only workloads have no use for the GPU at all.
     if compute_type == "CPU":
         flavors = list(cpu_flavors) if cpu_flavors else list(_DEFAULT_AGENT_CPU_FLAVORS)
+        # Clamp containerDiskInGb to RunPod's CPU-pod max (40). Without this,
+        # CPU dispatch 500s with "Container Disk must be less than or equal
+        # to 40" — a real bug we hit on the first CPU rollout (2026-05-13).
+        cpu_disk = min(settings.runpod_container_disk_gb, _CPU_POD_MAX_CONTAINER_DISK_GB)
         return SessionSpec(
             compute_type="CPU",
             cpu_flavors=flavors,
@@ -137,7 +150,7 @@ def _build_spec(
             network_volume_id=settings.runpod_network_volume_id,
             env=env,
             name=f"autoresearch-{run.id}",
-            container_disk_gb=settings.runpod_container_disk_gb,
+            container_disk_gb=cpu_disk,
             container_registry_auth_id=settings.runpod_container_registry_auth_id,
         )
 
@@ -246,6 +259,21 @@ def dispatch_new(
     handle = compute.create_session(spec)
     run.pod_handle = handle.id
     run.status = RunStatus.QUEUED
+    # Stash hardware spec into params so `get_run` shows what was requested.
+    # Audit trail: the local Claude reported it couldn't tell from the Run
+    # record whether compute_type="CPU" was honored. Now it can.
+    hw_audit = {
+        "compute_type": spec.compute_type,
+        "image": spec.image,
+    }
+    if spec.compute_type == "CPU":
+        hw_audit["cpu_flavors"] = list(spec.cpu_flavors)
+        hw_audit["vcpu_count"] = spec.vcpu_count
+    else:
+        hw_audit["gpu"] = spec.gpu if isinstance(spec.gpu, list) else [spec.gpu]
+        if required_vram_gb is not None:
+            hw_audit["required_vram_gb"] = required_vram_gb
+    run.params = {**(run.params or {}), "_dispatched_hardware": hw_audit}
     run.save(storage)
     return run
 

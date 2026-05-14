@@ -154,6 +154,67 @@ def test_boot_stalled_run_is_failed_and_pod_terminated(tmp_path: Path) -> None:
     assert any("BOOT-STALLED" in b for b in finding_bodies)
 
 
+def test_auto_postflight_does_not_loop_when_dispatch_fails(tmp_path: Path) -> None:
+    """Regression: a terminal transfer with auto_postflight=true whose
+    postflight dispatch raises must NOT spawn another postflight on the
+    next supervisor tick. The sentinel must be pinned to 'failed' on the
+    very first attempt.
+
+    Backstory: 17 zombie postflight Runs spawned in 11 minutes (one per
+    supervisor tick, every ~42s) because the sentinel was written only
+    on dispatch success. A failing CPU pod create kept clearing the
+    guard for the next tick.
+    """
+    from autoresearch.core import findings as findings_mod
+
+    settings = _settings()
+    storage = LocalStorage(tmp_path / "store")
+
+    class CompletelyBrokenCompute(FakeCompute):
+        def create_session(self, spec):
+            raise RuntimeError("RunPod 500: simulated catalog rejection")
+
+    compute = CompletelyBrokenCompute()
+    # Seed a terminal transfer with auto_postflight=true.
+    target = Run(
+        workflow="transfer", pipeline_name="x",
+        params={"target_model": "Q", "auto_postflight": True},
+        status=RunStatus.FAILED,
+        pod_handle="pod-old",  # already terminated upstream
+    )
+    target.save(storage)
+
+    sup = Supervisor(settings=settings, storage=storage, compute=compute)
+
+    # First tick: dispatch is attempted, it raises, sentinel gets pinned.
+    sup.tick()
+    fresh = Run.load(storage, target.id)
+    assert fresh.params.get("postflight_dispatch_failed") is True
+    finding_bodies = [f.body for f in findings_mod.list_findings(storage, fresh)]
+    assert any("auto-postflight dispatch failed" in b for b in finding_bodies)
+
+    # Second tick: must NOT attempt another dispatch. Reset the call recorder
+    # so we can prove no new attempt happens.
+    sup.tick()
+    sup.tick()
+    sup.tick()
+    # No Runs spawned at all (the broken compute would have recorded each
+    # attempted create_session; the failing creates leave orphan Run records
+    # but no NEW dispatch calls happened after the first).
+    # The post-first-tick state has 1 attempted create:
+    # ... but actually the failing create_session raises before recording, so
+    # `compute.created` stays empty. The real evidence is that no NEW
+    # postflight Runs exist. Count all Runs whose parent is the target:
+    all_runs = list(Run.list_all(storage))
+    postflight_children = [r for r in all_runs if r.parent_run_id == target.id and r.workflow == "postflight"]
+    # The failing create_session raises AFTER dispatch_new persists the Run
+    # (Run is saved before create_session is called), so each tick attempt
+    # would leave one orphan Run. Sentinel-on-first-attempt → exactly 1 orphan.
+    assert len(postflight_children) == 1, (
+        f"expected exactly 1 orphan postflight (one failed attempt), got {len(postflight_children)}"
+    )
+
+
 def test_recent_queued_run_with_no_heartbeat_is_left_alone(tmp_path: Path) -> None:
     """The boot-stall reaper must NOT fire on a Run that's still within the
     grace window — that's a normal boot, the pod just hasn't written its

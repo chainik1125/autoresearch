@@ -108,7 +108,22 @@ class Supervisor:
                 and run.workflow == "transfer"
                 and (run.params or {}).get("auto_postflight")
                 and not (run.params or {}).get("postflight_run_id")
+                and not (run.params or {}).get("postflight_dispatch_failed")
             ):
+                # IMPORTANT: write the one-shot sentinel BEFORE attempting the
+                # dispatch. Previously this block wrote the sentinel only on
+                # success, so a failing dispatch (e.g., RunPod 500) would loop
+                # forever — one zombie postflight Run per supervisor tick. The
+                # one-shot policy is correct: auto-postflight is best-effort,
+                # so a failure is logged as a finding and the user can
+                # manually `start_postflight(target_run_id=...)` if they want
+                # to retry.
+                run.params["postflight_dispatch_failed"] = "in_progress"
+                try:
+                    run.save(self.storage)
+                except Exception:  # noqa: BLE001 -- if we can't even save the sentinel, give up
+                    _log.exception("could not write postflight sentinel for %s; skipping", run.id)
+                    continue
                 try:
                     pf = dispatcher.dispatch_new(
                         workflow="postflight",
@@ -128,10 +143,25 @@ class Supervisor:
                         parent_run_id=run.id,
                     )
                     run.params["postflight_run_id"] = pf.id
+                    run.params["postflight_dispatch_failed"] = False  # success — clear the sentinel
                     run.save(self.storage)
                     _log.info("run %s terminal; auto-dispatched postflight as %s", run.id, pf.id)
-                except Exception:  # noqa: BLE001 -- best-effort; reap pod regardless
+                except Exception as exc:  # noqa: BLE001 -- best-effort; reap pod regardless
                     _log.exception("failed to auto-dispatch postflight for %s", run.id)
+                    # Pin the sentinel as "failed" so we never retry. Also write
+                    # a finding so the user sees why.
+                    run.params["postflight_dispatch_failed"] = True
+                    try:
+                        run.save(self.storage)
+                        from autoresearch.core import findings as findings_mod
+                        from autoresearch.core.findings import FindingType
+                        findings_mod.append(
+                            self.storage, run, FindingType.ERROR,
+                            f"auto-postflight dispatch failed: {exc!s}. "
+                            f"Manually retry with `start_postflight(target_run_id={run.id!r})`.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        _log.exception("could not pin postflight failure sentinel on %s", run.id)
 
             # --- Cleanup: terminate pods of terminal-status Runs --------
             if run.status in _TERMINAL_STATUSES and run.pod_handle:
