@@ -58,6 +58,37 @@ python3 -m autoresearch.boot_beacon "00 autoresearch source @ ${AUTORESEARCH_REF
 # Beacon 01: prove we got past argument-parsing / interpreter startup.
 python3 -m autoresearch.boot_beacon "01 entrypoint started; mode=pod, RUN_ID=${RUN_ID:-<unset>}" || true
 
+# Claude CLI probe. claude-agent-sdk spawns `claude` as a subprocess; when
+# that subprocess exits non-zero during initialize the SDK swallows stderr
+# and we only see "ProcessError: exit code 1". This probe runs the same
+# binary directly and captures output to a finding so we can SEE the real
+# error. Best-effort — never blocks boot.
+{
+    echo "=== which claude ==="
+    which claude || echo "(claude not in PATH)"
+    echo
+    echo "=== claude --version ==="
+    claude --version 2>&1 || echo "(--version failed)"
+    echo
+    echo "=== LLM-related env keys (names only, NO VALUES) ==="
+    printenv | awk -F= '/^(ANTHROPIC|CLAUDE)_/ {print $1}'
+    echo
+    echo "=== minimal headless probe: claude --print 'reply ok' ==="
+    echo "reply with the word ok and nothing else" \
+        | timeout 30 claude --print 2>&1 | head -30 || echo "(probe failed/timed out)"
+} > /tmp/claude_probe.log 2>&1
+python3 -c "
+import os
+from autoresearch.config import Settings, build_storage
+from autoresearch.core.run import Run
+from autoresearch.core.findings import append, FindingType
+s = Settings.load(); st = build_storage(s)
+r = Run.load(st, os.environ['RUN_ID'])
+with open('/tmp/claude_probe.log') as f: body = f.read()
+append(st, r, FindingType.OBSERVATION, '[claude probe]\n```\n' + body[:6000] + '\n```')
+" 2>/dev/null || true
+python3 -m autoresearch.boot_beacon "01b claude CLI probe written" || true
+
 # Start sshd in the background so the pod is shell-accessible for debugging.
 # RunPod's pod-create wiring exposes port 22 + injects the operator's public keys
 # into $PUBLIC_KEY. The base image has /usr/sbin/sshd; we just need to give it
