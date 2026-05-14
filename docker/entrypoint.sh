@@ -11,7 +11,14 @@
 #   - Optional: $PROJECT_REPO_URL clones the user's project onto the volume on first boot.
 #   - Optional: project's requirements.txt installs once per volume (marker-gated).
 
-set -euo pipefail
+# NOTE: deliberately NOT using `set -e` globally. Pod boots have been
+# silently failing with no externally-visible log surface. We trade strict
+# failure semantics for diagnostic visibility: every major checkpoint
+# writes a `boot_beacon` finding to R2, so if the pod wedges we can see
+# exactly which step ran last via `list_findings(run_id)`. Explicit exits
+# (`exit 2`, `exit 3`) still terminate; individual command failures just
+# print to stderr and the entrypoint continues.
+set -uo pipefail
 
 MODE="${MODE:-pod}"
 
@@ -21,6 +28,11 @@ if [[ "$MODE" == "serve" ]]; then
 fi
 
 # --- pod mode ---
+
+# First beacon: prove we got past argument-parsing / interpreter startup.
+# If this finding never appears, the failure is in the image itself (pull,
+# entrypoint syntax, base image init) — not in subsequent steps.
+python3 -m autoresearch.boot_beacon "01 entrypoint started; mode=pod, RUN_ID=${RUN_ID:-<unset>}" || true
 
 # Start sshd in the background so the pod is shell-accessible for debugging.
 # RunPod's pod-create wiring exposes port 22 + injects the operator's public keys
@@ -35,12 +47,14 @@ if [[ -x /usr/sbin/sshd ]]; then
         chmod 600 /root/.ssh/authorized_keys
     fi
     ssh-keygen -A 2>/dev/null || true
-    /usr/sbin/sshd
+    /usr/sbin/sshd || echo "[entrypoint] WARN: sshd start failed (continuing)"
     echo "[entrypoint] sshd started; debug with: ssh -p <port> root@<ip>"
 fi
+python3 -m autoresearch.boot_beacon "02 sshd attempted" || true
 
 WORKSPACE="${WORKSPACE_DIR:-/workspace}"
 mkdir -p "${WORKSPACE}/.huggingface" "${WORKSPACE}/.cache/pip"
+python3 -m autoresearch.boot_beacon "03 workspace mounted at ${WORKSPACE}" || true
 
 # Disk preflight. Writes a finding with df output, and hard-aborts before any
 # heavy work if free space is below the floor. Tuned for "model weights +
@@ -49,15 +63,16 @@ mkdir -p "${WORKSPACE}/.huggingface" "${WORKSPACE}/.cache/pip"
 export AUTORESEARCH_MIN_FREE_GB="${AUTORESEARCH_MIN_FREE_GB:-25}"
 export AUTORESEARCH_DISK_PREFLIGHT_PATH="${WORKSPACE}"
 if [[ -n "${RUN_ID:-}" ]]; then
-    set +e
     python3 -m autoresearch.disk_preflight
     DISK_RC=$?
-    set -e
     if [[ $DISK_RC -ne 0 ]]; then
+        python3 -m autoresearch.boot_beacon "04 disk preflight FAILED rc=$DISK_RC" || true
         echo "[entrypoint] FATAL: disk preflight failed (rc=$DISK_RC); aborting before heavy work" >&2
+        sleep 600  # keep pod alive long enough for SSH inspection
         exit 3
     fi
 fi
+python3 -m autoresearch.boot_beacon "04 disk preflight passed" || true
 
 # Default HF env if the dispatcher didn't already inject them.
 export HF_HOME="${HF_HOME:-${WORKSPACE}/.huggingface}"
@@ -94,6 +109,7 @@ fi
 if [[ -d "${WORKSPACE}/project/pipelines" ]] && [[ ! -e "${WORKSPACE}/pipelines" ]]; then
     ln -s "${WORKSPACE}/project/pipelines" "${WORKSPACE}/pipelines"
 fi
+python3 -m autoresearch.boot_beacon "05 project repo + pipelines symlink ready" || true
 
 # Install project requirements once per volume. Marker prevents re-running on
 # subsequent pod boots (each volume gets its install cache warmed on the first boot
@@ -104,42 +120,31 @@ for candidate in "${WORKSPACE}/project/requirements.txt" "${WORKSPACE}/pipelines
 done
 PIP_LOG="${WORKSPACE}/.cache/pip-install.log"
 if [[ -n "$REQ_FILE" ]]; then
-    # We used to gate pip install on a marker file living on the volume, on the
-    # theory that "install once per volume" amortized cost across pod boots.
-    # That was wrong: the volume persists but the container's site-packages does
-    # NOT, so a fresh pod with a stale marker would skip install and crash on
-    # ImportError. Always install; the on-volume pip cache at $PIP_CACHE_DIR
-    # makes re-runs fast (~30-60s wheels-from-cache vs ~5min cold).
     echo "[entrypoint] pip install -r $REQ_FILE (cache: $PIP_CACHE_DIR; log -> $PIP_LOG)"
-    set +e
     pip install --cache-dir "$PIP_CACHE_DIR" -r "$REQ_FILE" 2>&1 | tee "$PIP_LOG"
     PIP_RC=${PIPESTATUS[0]}
-    set -e
     if [[ $PIP_RC -ne 0 ]]; then
         echo "[entrypoint] WARN: pip install exit $PIP_RC; continuing so runner can report a clean error"
+        python3 -m autoresearch.boot_beacon "06 pip install WARNED rc=$PIP_RC (continuing)" || true
+    else
+        python3 -m autoresearch.boot_beacon "06 pip install ok" || true
     fi
+else
+    python3 -m autoresearch.boot_beacon "06 no requirements.txt found (skipped pip install)" || true
 fi
 
 if [[ -z "${RUN_ID:-}" ]]; then
     echo "[entrypoint] FATAL: RUN_ID env var is required in pod mode" >&2
+    sleep 600
     exit 2
 fi
 
 echo "[entrypoint] mode=pod  RUN_ID=$RUN_ID  starting runner"
-# Don't exec — we want to run a post-failure log-snapshot hook so that
-# diagnostic logs from a failing pipeline subprocess (e.g. a SAE training run
-# that wrote /workspace/saes/<m>/<h>/training.log) are surfaced via the
-# `list_findings` MCP tool. Without this, the only way to see those logs is to
-# spin a separate shell pod and SSH the volume — which has cost us a lot of
-# debugging time on this branch.
-#
-# CRITICAL: disable `set -e` for the runner call. The whole point of the
-# snapshot below is to handle a non-zero exit; if `set -e` aborts the script
-# at the first failure we never reach it.
-set +e
+python3 -m autoresearch.boot_beacon "07 about to invoke 'autoresearch run'" || true
+
 autoresearch run --run-id "$RUN_ID" --heartbeat "$@"
 RUNNER_RC=$?
-set -e
+python3 -m autoresearch.boot_beacon "08 'autoresearch run' returned rc=$RUNNER_RC" || true
 
 if [[ $RUNNER_RC -ne 0 ]]; then
     echo "[entrypoint] runner exited $RUNNER_RC; snapshotting recent training logs as findings"
