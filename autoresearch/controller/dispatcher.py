@@ -313,10 +313,20 @@ def _looks_like_no_stock(exc: Exception) -> bool:
     RunPod returns 500 with bodies like `"create pod: There are no longer
     any instances available with the requested specifications"` or `"create
     pod: There are no instances currently available"`. We sniff for these
-    strings rather than relying on the HTTP status alone (500 is too
-    generic).
+    strings — but httpx's `HTTPStatusError.__str__` does NOT include the
+    response body (only the status line), so we have to dig into
+    `exc.response.text` if it exists.
     """
-    msg = str(exc).lower()
+    candidates = [str(exc).lower()]
+    # httpx.HTTPStatusError carries the response object; the body is where
+    # the "no instances" string actually lives.
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            candidates.append(response.text.lower())
+        except Exception:  # noqa: BLE001
+            pass
+    msg = " ".join(candidates)
     return "no instances" in msg or "no longer any instances" in msg or "no instance" in msg
 
 
