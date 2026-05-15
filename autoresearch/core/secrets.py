@@ -20,6 +20,7 @@ _PASSTHROUGH_SECRETS = (
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",         # CodexRunner fallback when Anthropic is down
     "HF_TOKEN",
     "WANDB_API_KEY",          # for sae_lens / general training-metrics logging
 )
