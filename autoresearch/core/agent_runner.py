@@ -132,17 +132,18 @@ class ClaudeCodeRunner:
         except ImportError as e:
             raise RunnerError(f"claude-agent-sdk not installed: {e}") from e
         except Exception as e:  # noqa: BLE001
-            # The SDK raises ProcessError for CLI failures; httpx exceptions
-            # for transport issues; CLINotFoundError when claude isn't in
-            # PATH. All of these are recoverable — fall back to the next
-            # runner.
-            err_name = type(e).__name__
-            if err_name in (
-                "ProcessError", "CLINotFoundError", "CLIConnectionError",
-                "ConnectError", "ReadTimeout", "ConnectTimeout",
-            ) or "rate_limit" in str(e).lower() or "overloaded" in str(e).lower():
-                raise RunnerError(f"claude-agent-sdk {err_name}: {str(e)[:200]}") from e
-            raise
+            # ANY exception from the SDK call is a runner-failure: auth
+            # errors, rate limits, transport failures, the CLI's
+            # "Not logged in" response, malformed result messages, etc.
+            # We can't enumerate every shape the SDK might raise, so treat
+            # them all as recoverable and let the chain try the next
+            # runner. Programming bugs in OUR code happen BEFORE the SDK
+            # call (the `asyncio.run` line); they'll surface as
+            # NameError/AttributeError at module/function-import time and
+            # won't reach this except.
+            raise RunnerError(
+                f"claude-code: {type(e).__name__}: {str(e)[:300]}"
+            ) from e
 
         return _finalize_agent_result(
             run=run, storage=storage, label=label,
