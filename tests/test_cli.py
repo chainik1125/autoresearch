@@ -127,13 +127,17 @@ def test_cli_agent_workflow_without_api_key_exits_zero(cli_env: dict[str, str], 
     run = Run(workflow="prepare", pipeline_name="x", params={})
     run.save(storage)
 
-    # Run with NO ANTHROPIC_API_KEY anywhere (including inherited env from
+    # Run with NEITHER provider key anywhere (including inherited env from
     # the developer's shell — the run_cli helper treats None as "unset").
+    # Prepare workflow's gate requires at least one of ANTHROPIC_API_KEY OR
+    # OPENAI_API_KEY (since the AgentRunner chain has Claude + Codex
+    # implementations). With neither set, the gate fails cleanly.
     env: dict[str, str | None] = {
         **cli_env,
         "AUTORESEARCH_STORAGE_ROOT": str(store_root),
         "ANTHROPIC_API_KEY": None,
         "AUTORESEARCH_ANTHROPIC_API_KEY": None,
+        "OPENAI_API_KEY": None,
     }
     proc = run_cli("run", "--run-id", run.id, "--heartbeat", env=env)
 
@@ -143,4 +147,4 @@ def test_cli_agent_workflow_without_api_key_exits_zero(cli_env: dict[str, str], 
     # Run status must be FAILED with a clear last_error
     fresh = Run.load(storage, run.id)
     assert fresh.status == RunStatus.FAILED
-    assert "ANTHROPIC_API_KEY" in (fresh.last_error or "")
+    assert "API key" in (fresh.last_error or "")

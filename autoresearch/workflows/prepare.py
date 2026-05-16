@@ -176,7 +176,15 @@ def _commit_and_push(repo_root: Path, branch: str, run_id: str) -> tuple[bool, s
         auth_url = remote_url.replace("https://", f"https://{token}@", 1).strip()
         _run_git(["git", "remote", "set-url", "origin", auth_url], repo_root)
     rc_p, out_p = _run_git(["git", "push", "-u", "origin", branch], repo_root)
-    return rc_p == 0, f"commit rc={rc_c} {out_c[-200:]}; push rc={rc_p} {out_p[-200:]}"
+    # CRITICAL: scrub the PAT from the push output before returning it.
+    # git error messages echo the remote URL verbatim, including
+    # `https://<token>@github.com/...`. Without this, the token lands in
+    # the ERROR finding the caller writes to R2 and is visible to anyone
+    # who reads list_findings.
+    safe_out_p = out_p
+    if token:
+        safe_out_p = safe_out_p.replace(token, "<PROJECT_REPO_TOKEN-redacted>")
+    return rc_p == 0, f"commit rc={rc_c} {out_c[-200:]}; push rc={rc_p} {safe_out_p[-200:]}"
 
 
 def prepare(

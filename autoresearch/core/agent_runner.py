@@ -258,9 +258,10 @@ def _probe_claude_cli(*, run: Run, storage: StorageBackend, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-# Default model for the Codex fallback. OpenAI's coding-tuned model.
-# The "gpt-5-codex" name is the public alias as of 2026-05.
-_CODEX_MODEL = os.environ.get("AUTORESEARCH_CODEX_MODEL", "gpt-5-codex")
+# Default model for the Codex fallback. Override via env var.
+# OpenAI's exact model names move; pick a stable general-purpose default
+# and let users pin a specific one via AUTORESEARCH_CODEX_MODEL.
+_CODEX_MODEL = os.environ.get("AUTORESEARCH_CODEX_MODEL", "gpt-5")
 
 # Rough USD per million tokens for cost tracking. Approximate; refine when
 # OpenAI publishes more precise rates.

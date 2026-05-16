@@ -142,25 +142,46 @@ def cmd_run(args: argparse.Namespace) -> int:
             heartbeat=args.heartbeat,
         )
     elif workflow in ("prepare", "mechanic", "postflight"):
-        # Agent workflows: all three need ANTHROPIC_API_KEY (the SDK reads it
-        # from env, and mechanic also uses the client object directly). If the
-        # key isn't set, exit 0 — NOT 2 — so RunPod doesn't restart-loop us
-        # on a structural config gap. Pin status=FAILED + write an ERROR
-        # finding first so the user sees what happened.
-        if model_client is None:
-            from autoresearch.core import findings as findings_mod
-            from autoresearch.core.findings import FindingType
-            from autoresearch.core.run import RunStatus as _RS
-            msg = (
-                f"workflow={workflow} requires ANTHROPIC_API_KEY to be set in "
-                f"the controller's env (it's forwarded to pods). Add it on "
-                f"Railway, then redispatch this Run."
+        # Agent workflow gating differs by workflow:
+        #   - mechanic uses run_agent_single_shot, which directly needs the
+        #     ModelClient object (today: Anthropic only). Gate on it.
+        #   - prepare + postflight use run_agent_with_tools, which delegates
+        #     to a runner chain (ClaudeCodeRunner → CodexRunner). They only
+        #     need at least ONE provider key in env, not the ModelClient
+        #     object specifically. Gate on env vars directly.
+        #
+        # If the gate fails, exit 0 (NOT 2) so RunPod doesn't restart-loop
+        # us on a structural config gap. Pin status=FAILED + ERROR finding
+        # first so the user sees what happened.
+        import os as _os
+        from autoresearch.core import findings as findings_mod
+        from autoresearch.core.findings import FindingType
+        from autoresearch.core.run import RunStatus as _RS
+
+        gate_failed_msg: str | None = None
+        if workflow == "mechanic" and model_client is None:
+            gate_failed_msg = (
+                "workflow=mechanic requires ANTHROPIC_API_KEY to be set "
+                "(mechanic is single-shot and uses the ModelClient directly). "
+                "Add it on Railway, then redispatch."
             )
-            print(msg, file=sys.stderr)
-            findings_mod.append(storage, run, FindingType.ERROR, msg)
+        elif workflow in ("prepare", "postflight"):
+            has_anthropic = bool(_os.environ.get("ANTHROPIC_API_KEY"))
+            has_openai = bool(_os.environ.get("OPENAI_API_KEY"))
+            if not (has_anthropic or has_openai):
+                gate_failed_msg = (
+                    f"workflow={workflow} requires at least one of "
+                    "ANTHROPIC_API_KEY (for claude-code runner) or "
+                    "OPENAI_API_KEY (for codex fallback) to be set in pod "
+                    "env. Add one on Railway, then redispatch."
+                )
+
+        if gate_failed_msg:
+            print(gate_failed_msg, file=sys.stderr)
+            findings_mod.append(storage, run, FindingType.ERROR, gate_failed_msg)
             fresh = Run.load(storage, run.id)
             fresh.status = _RS.FAILED
-            fresh.last_error = "missing ANTHROPIC_API_KEY"
+            fresh.last_error = "missing required API key(s) for this workflow"
             fresh.save(storage)
             return 0  # exit 0 -> RunPod doesn't restart-loop
         if workflow == "prepare":
